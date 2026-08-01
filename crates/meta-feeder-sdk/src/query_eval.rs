@@ -27,6 +27,16 @@ pub fn record_matches(fields: &BTreeMap<String, String>, query: &GatewayQuery) -
             }
             continue;
         }
+        // `genres` is a key-set too (`genres/<Name> = "true"`, METADATA_KEYS
+        // §`genres/{name}`) on everything the card tier writes. Without this arm
+        // a `genres:` filter looks up a flat `genres` field, finds nothing on a
+        // card, and drops it — so a genre-scoped row would return empty.
+        if key == "genres" {
+            if !genres_filter_matches(fields, allowed) {
+                return false;
+            }
+            continue;
+        }
         let Some(field_value) = fields.get(key) else {
             return false;
         };
@@ -155,6 +165,54 @@ fn record_has_concrete_language(fields: &BTreeMap<String, String>) -> bool {
 
 /// Key-set members are written as the literal `"true"`; tolerate a couple of
 /// obvious truthy spellings and treat anything else as absent.
+/// Fold a genre label to its comparison form: lowercase, alphanumerics only.
+///
+/// Genre display names carry spaces and ampersands (`"Action & Adventure"`,
+/// `"Sci-Fi & Fantasy"`, `"Science Fiction"`), and **space is the query DSL's
+/// token separator** — so a filter can never spell a genre the way the record
+/// stores it. Callers pass a slug (`genres:action-adventure`); folding both
+/// sides makes them one value without forcing the stored name to be
+/// machine-shaped.
+fn genre_fold(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+/// True iff the record carries one of the requested genres, in **either**
+/// encoding: a truthy `genres/<Name>` key-set member (the card tier's shape) or
+/// the legacy flat comma-joined `genres` field. OR across the requested genres,
+/// both sides folded — see [`genre_fold`].
+///
+/// **Fails closed, unlike [`languages_filter_matches`].** A language filter is a
+/// viewer *preference* narrowing a set, so an unknown-language release is kept.
+/// A genre filter *defines what a row is*: a record with no genre information is
+/// not known to be Action, so putting it in an Action row states something
+/// untrue. Upstream has already filtered by genre, so this is a re-validation.
+fn genres_filter_matches(fields: &BTreeMap<String, String>, allowed: &[String]) -> bool {
+    let wanted: Vec<String> = allowed.iter().map(|g| genre_fold(g)).collect();
+    if wanted.iter().all(|g| g.is_empty()) {
+        return true; // a filter with no usable value constrains nothing
+    }
+    for (key, value) in fields {
+        let Some(name) = key.strip_prefix("genres/") else {
+            continue;
+        };
+        if is_truthy_member(value) && wanted.contains(&genre_fold(name)) {
+            return true;
+        }
+    }
+    if let Some(flat) = fields.get("genres") {
+        for member in flat.split(|c| c == ',' || c == '|') {
+            if wanted.contains(&genre_fold(member)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_truthy_member(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
