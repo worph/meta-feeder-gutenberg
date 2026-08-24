@@ -184,6 +184,48 @@ impl FeederStore {
         &self.meta_core_url
     }
 
+    /// Raw keys containing `contains` (`GET /api/kv/search`). Returns
+    /// `(keys, truncated)`; `truncated` means the server capped the result and
+    /// there may be more.
+    ///
+    /// This is a keyspace scan, so it belongs on rare control-plane paths only —
+    /// today, invalidating the gateway's search-coverage markers when a feeder's
+    /// upstream source set changes. Never call it per search.
+    pub async fn search_keys(&self, contains: &str, limit: usize) -> anyhow::Result<(Vec<String>, bool)> {
+        let url = format!("{}/api/kv/search", self.meta_core_url);
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("contains", contains), ("limit", &limit.to_string())])
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            anyhow::bail!("meta-core KV search `{contains}` returned {status}");
+        }
+        #[derive(Deserialize)]
+        struct KvSearchResponse {
+            #[serde(default)]
+            keys: Vec<String>,
+            #[serde(default)]
+            truncated: bool,
+        }
+        let body: KvSearchResponse = resp.json().await?;
+        Ok((body.keys, body.truncated))
+    }
+
+    /// Delete one raw KV key (`DELETE /api/kv/value?key=`). A missing key is not
+    /// an error.
+    pub async fn delete_kv(&self, key: &str) -> anyhow::Result<()> {
+        let url = format!("{}/api/kv/value", self.meta_core_url);
+        let resp = self.http.delete(&url).query(&[("key", key)]).send().await?;
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        anyhow::bail!("meta-core KV DELETE {key} returned {status}");
+    }
+
     /// Self-publish a **metadata-only** outcome to meta-core, returning the
     /// **sparse** outcome (`record: None`) so the gateway's `(_, None)` branch
     /// skips it — no double write. Byte outcomes and already-sparse outcomes are

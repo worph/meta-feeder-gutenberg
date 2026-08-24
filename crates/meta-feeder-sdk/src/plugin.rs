@@ -57,6 +57,30 @@ pub struct HashOutcome {
 ///   today emits.
 /// - `BtV1File` — a single file inside a BitTorrent v1 torrent, custom
 ///   multicodec `0x1001`. Locator, not content hash: opaque to bitswap.
+/// - `NzbRelease` — a Usenet release (a Newznab listing), custom multicodec
+///   `nzb-release` `0x1005`. Self-describing locator: the cid embeds `{host,
+///   id}` in an identity multihash, opaque to bitswap and redeemed to bytes
+///   only by a credentialed meta-share peer, which decodes the locator from the
+///   cid and grabs the `.nzb` via `t=get` — no KV side-table.
+/// - `CardLocator` — the identity of a *work* (a series, a film) as published by
+///   a metadata bridge, custom multicodec `0x1007`. The only family with **no
+///   bytes behind it at all**: the record IS the payload. Always paired with
+///   `bytes: None`, so it lands in the `(None, Some)` metadata-only branch
+///   above. Opaque to bitswap, and deliberately so — there is nothing to seed.
+/// - `NzbPosting` — a Usenet posting we **scanned ourselves**, custom multicodec
+///   `nzb-posting` `0x1003`. A content-derived digest over the article
+///   Message-ID set (not a locator: no host is embedded), so any peer with a
+///   plain NNTP provider can fetch it — no `IndexerCred`. Opaque to bitswap: the
+///   digest is over the id set, not over any block, so the `.nzb` manifest
+///   travels separately as an ordinary sha2-256 cid in the record's `manifest`
+///   field. Produced by `hash::compute_nzb_posting_cid`.
+/// - `YtVideo` — a **delegated-playback** reference, custom multicodec
+///   `yt-video` `0x1008`. Like `CardLocator` it is always paired with
+///   `bytes: None` and lands in the `(None, Some)` metadata-only branch, but it
+///   means something stronger than "no bytes yet": the bytes **exist and are
+///   permanently someone else's**. Nothing is fetched, seeded or
+///   content-addressed, and meta-share's byte path REFUSES the cid with a `400`
+///   rather than 404ing. Produced by `hash::compute_yt_video_cid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashKind {
     /// Reserved: no feeder currently emits midhash256 outcomes, but the family
@@ -65,6 +89,10 @@ pub enum HashKind {
     Midhash256,
     Sha2_256,
     BtV1File,
+    NzbRelease,
+    CardLocator,
+    NzbPosting,
+    YtVideo,
 }
 
 /// Startup-only configuration error returned by [`FeederPlugin::configure`].
@@ -99,6 +127,33 @@ pub enum ConfigError {
 /// `format!("{upstream_id}id")` — lowercase, no separator.
 pub fn upstream_id_field(upstream_id: &str) -> String {
     format!("{upstream_id}id")
+}
+
+/// Key-set prefix for the provenance `source/<label>` field (METADATA_KEYS §5).
+/// Each member is its own hash field (`source/gateway:nyaa.si = "true"`) so two
+/// producers that reach the same content by different routes union without a
+/// last-writer-wins clobber. The `<label>` uses `:` internally (not `/`, which
+/// is the key-set path separator) — e.g. `gateway:nyaa.si`, `gateway:tribler`.
+pub const SOURCE_KEYSET_PREFIX: &str = "source/";
+
+/// Stamp the SDK's default provenance member — `source/gateway:<upstream_id>` —
+/// onto a record's fields, but **only if it carries no `source/*` member yet**.
+/// This gives every gateway hit a provenance label for free (so meta-watch never
+/// falls back to "unknown" for a feeder record), while a plugin that knows a
+/// finer origin (torznab → the specific Prowlarr indexer) stamps its own flat
+/// `source/*` facets first (`source/gateway`, `source/<protocol>`,
+/// `source/<indexer-slug>`) and this default then no-ops.
+pub fn stamp_default_source(
+    fields: &mut std::collections::BTreeMap<String, String>,
+    upstream_id: &str,
+) {
+    if fields.keys().any(|k| k.starts_with(SOURCE_KEYSET_PREFIX)) {
+        return;
+    }
+    fields.insert(
+        format!("{SOURCE_KEYSET_PREFIX}gateway:{upstream_id}"),
+        "true".to_string(),
+    );
 }
 
 /// Static plugin contract. Each enabled `upstream_id` is implemented by

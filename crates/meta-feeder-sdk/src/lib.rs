@@ -14,6 +14,13 @@
 // pure noise for a single-process store, so silence the lint crate-wide.
 #![allow(clippy::result_large_err)]
 
+/// pcs-convention default meta-core root a self-publishing feeder targets when
+/// neither its dashboard config nor the `META_CORE_URL` env seed sets one. Keeps
+/// the modular storage seam out of compose: a standard install just works; a
+/// non-standard meta-core is set in the feeder's config UI. Matches the
+/// `metacore-app` service the AppStore feeder apps ship on the shared network.
+pub const DEFAULT_META_CORE_URL: &str = "http://metacore-app:9000";
+
 pub mod cache;
 pub mod common;
 pub mod config;

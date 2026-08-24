@@ -160,6 +160,333 @@ fn bt_file_cid(codec: u64, infohash: &[u8], file_index: u64) -> String {
     format!("b{}", base32_lower_no_padding(&wire))
 }
 
+/// Custom multicodec for a self-describing **Newznab release** locator
+/// (`nzb-release`). MetaMesh-private, adjacent to the torrent-file codecs in the
+/// `0x10xx` range. Unlike a content hash, the cid *embeds* the indexer host +
+/// release id in an identity multihash, so the credentialed meta-share peer
+/// decodes `{host,id}` straight from the cid and grabs the `.nzb` via `t=get`
+/// only at playback — no side-table, no `.nzb` download at search time. (The
+/// `0x1004` `sha256(host‖id)` opaque hash and the `0x1003` `nzb-posting`
+/// variant were both removed; only this self-describing form is emitted.)
+pub const NZB_RELEASE_CODEC: u64 = 0x1005;
+
+/// Digest byte ceiling for an `nzb-release` cid, matching meta-share's
+/// `MAX_MULTIHASH_SIZE` — its `CidGeneric<64>` rejects a longer multihash.
+const NZB_RELEASE_MAX_DIGEST: usize = 64;
+
+/// Encode a self-describing `nzb-release` CID from a Newznab indexer's host +
+/// bare release id (the hex `<guid>` id). The multihash is *identity* (`0x00`)
+/// and its digest embeds the locator as `varint(host_len) ‖ host ‖ id_bytes`,
+/// where `id_bytes` is the hex-decoded id. meta-share's `decode_nzb_release_cid`
+/// is the exact inverse. Host-namespaced: the same release on two indexers
+/// yields different cids.
+///
+/// Returns `None` when the id isn't hex or the digest would overflow the
+/// multihash budget (an oversized host) — the caller drops that row.
+pub fn compute_nzb_release_cid(api_base: &str, release_id: &str) -> Option<String> {
+    let id_bytes = decode_hex_id(release_id)?;
+    let host_b = api_base.as_bytes();
+
+    // identity-multihash digest = varint(host_len) ‖ host ‖ id_bytes
+    let mut digest = Vec::with_capacity(2 + host_b.len() + id_bytes.len());
+    write_pb_varint(host_b.len() as u64, &mut digest);
+    digest.extend_from_slice(host_b);
+    digest.extend_from_slice(&id_bytes);
+    if digest.len() > NZB_RELEASE_MAX_DIGEST {
+        return None;
+    }
+
+    // CIDv1: [version=0x01][codec varint][mh code=0x00 identity][len varint][digest]
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01);
+    write_pb_varint(NZB_RELEASE_CODEC, &mut wire);
+    wire.push(0x00); // multihash code: identity
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(&digest);
+    Some(format!("b{}", base32_lower_no_padding(&wire)))
+}
+
+/// Hex-decode a Newznab release id. The guid parser only keeps hex runs, so the
+/// id is all-hex by construction; odd-length ids are left-padded with a `0`
+/// nibble. Returns `None` on any non-hex byte (defensive).
+fn decode_hex_id(id: &str) -> Option<Vec<u8>> {
+    let padded;
+    let s: &str = if id.len() % 2 == 1 {
+        padded = format!("0{id}");
+        &padded
+    } else {
+        id
+    };
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push(((hi << 4) | lo) as u8);
+    }
+    Some(out)
+}
+
+/// Custom multicodec for a **card locator** — the identity of a *work* (a
+/// series, a film) as published by a metadata bridge, rather than of any
+/// bytes. MetaMesh-private, the next free slot after `0x1006` url. (`0x1004`
+/// nzb-release-hash stays **retired — do not reuse**. `0x1003` was retired too,
+/// but has since been **revived** for the self-scanned Usenet posting identity —
+/// see [`NZB_POSTING_CODEC`] and `METADATA_KEYS.md` §2.)
+///
+/// This is the first CID family in the platform where **no bytes exist
+/// anywhere, ever** — `0x1005`/`0x1006` are locators too, but both eventually
+/// resolve to bytes (NNTP, HTTP), and `0x1000` midhash256 is a digest over
+/// real file bytes. A card is pure identity: the record *is* the payload, and
+/// it lives in meta-core. Consequences, all already handled:
+///
+/// * Bitswap seeding is gated on `HashKind::Sha2_256` (gateway invariant 6),
+///   so a card is never offered to the swarm — nothing to seed.
+/// * meta-share's byte path 404s for it, which is correct.
+/// * It ranks `RANK_LOCATOR` (5), so it can never outrank a real digest for
+///   `canonical_cid` — which is what makes the future "one card, two CIDs"
+///   merge (a TMDB and a MyAnimeList locator on one meta-core record) safe.
+pub const CARD_LOCATOR_CODEC: u64 = 0x1007;
+
+/// Digest byte ceiling for a card locator, matching meta-share's
+/// `MAX_MULTIHASH_SIZE` — its `CidGeneric<64>` rejects a longer multihash.
+const CARD_LOCATOR_MAX_DIGEST: usize = 64;
+
+/// Encode a self-describing **card locator** CID from a metadata source and
+/// that source's own id for the work (`("tmdb", "tv:95479")`,
+/// `("mal", "52991")`). The multihash is *identity* (`0x00`) and its digest
+/// embeds the locator as `varint(source_len) ‖ source ‖ id`, both UTF-8 —
+/// exactly the shape [`compute_nzb_release_cid`] uses, minus the hex decode
+/// (a card id is arbitrary text, not a hex release id).
+///
+/// **The CID is a pure function of `(source, id)`**, which is the whole point:
+/// any peer that knows a tmdb id can derive the card's address offline and
+/// look it up locally, with no discovery round-trip. It also means the same
+/// card discovered by two different peers converges on one meta-core record
+/// for free, via the `cids/<bareCid>` reverse index.
+///
+/// Source-namespaced: the same work on TMDB and on MyAnimeList yields
+/// different cids. Merging those two into one record is a meta-core alias
+/// operation driven by an explicit cross-source id mapping — never inferred
+/// here (see `meta-gateway/docs/others/card-tier-search.md` §9).
+///
+/// Returns `None` when `source` is empty or the digest would overflow the
+/// multihash budget — the caller drops that card.
+pub fn compute_card_cid(source: &str, id: &str) -> Option<String> {
+    if source.is_empty() || id.is_empty() {
+        return None;
+    }
+    let source_b = source.as_bytes();
+    let id_b = id.as_bytes();
+
+    // identity-multihash digest = varint(source_len) ‖ source ‖ id
+    let mut digest = Vec::with_capacity(2 + source_b.len() + id_b.len());
+    write_pb_varint(source_b.len() as u64, &mut digest);
+    digest.extend_from_slice(source_b);
+    digest.extend_from_slice(id_b);
+    if digest.len() > CARD_LOCATOR_MAX_DIGEST {
+        return None;
+    }
+
+    // CIDv1: [version=0x01][codec varint][mh code=0x00 identity][len varint][digest]
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01);
+    write_pb_varint(CARD_LOCATOR_CODEC, &mut wire);
+    wire.push(0x00); // multihash code: identity
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(&digest);
+    Some(format!("b{}", base32_lower_no_padding(&wire)))
+}
+
+// ---------------------------------------------------------------------------
+// Delegated-playback locators — `yt-video` (0x1008) and `ext-play` (0x1009)
+// ---------------------------------------------------------------------------
+//
+// These two are the limit case *beyond* `card` (0x1007). `card` addresses a
+// work with no bytes anywhere; these address a **rendition whose bytes exist
+// but are permanently someone else's**. An external player renders the media,
+// nothing is transported, nothing is content-addressed, nothing is re-seedable.
+//
+// See `docs/cid-formats.md` §7 and
+// `docs/study/listenbrainz-youtube-playback-tier-2026-08-21.md`.
+
+/// Custom multicodec for a **YouTube rendition** — delegated playback.
+///
+/// Its own codec rather than a `url` (`0x1006`) for three reasons, in
+/// descending order of how much trouble the alternative causes:
+///
+/// * **`0x1006` means "fetch these bytes once and seed them".** Point a `url`
+///   locator at a `watch` page and meta-share does exactly that: fetches the
+///   HTML, chunks it, seeds it, and links the resulting content CID back onto
+///   the record *as the file*. That is the MSR1 poisoning shape, except
+///   permanent and replicated across peers. A resolved `googlevideo` URL is no
+///   better — time-limited and IP-bound, so it is not a locator at all.
+/// * **The id is canonical, a URL is not.** `youtube.com` / `music.youtube.com`
+///   / `youtu.be` all address the same video, and query parameters are tracking
+///   noise, so the same rendition would mint several different CIDs. Being a
+///   pure function of `(kind, id)`, this codec makes two peers that resolve the
+///   same track converge on one meta-core record for free, via the
+///   `cids/<bareCid>` reverse index — the property that makes [`compute_card_cid`]
+///   useful, for the same reason.
+/// * **It is tiny** — 11 bytes of id plus a short kind prefix.
+///
+/// ⚠ **An immutable id is not durable playback.** Takedowns, geo-blocks and
+/// embed-disabled uploads all kill a reference whose CID stays valid forever —
+/// the same rot class as [`NZB_RELEASE_CODEC`]. The mitigation is at the
+/// *record* level (carry several ranked references per recording so a client
+/// can fall through), never at the CID level.
+pub const YT_VIDEO_CODEC: u64 = 0x1008;
+
+/// Custom multicodec for an **external page to open, never fetch**.
+///
+/// Wire-identical to `url` (`0x1006`) apart from the codec, and that difference
+/// is the entire contract: `0x1006` resolves cache-through and lands in the
+/// blockstore, `0x1009` **must be refused by the byte path** and only ever
+/// surfaces as an "Open on …↗" affordance. Use it for anything worth linking
+/// but not worth a per-provider codec (Bandcamp, Jamendo, an arbitrary stream
+/// page).
+pub const EXT_PLAY_CODEC: u64 = 0x1009;
+
+/// Encode a [`YT_VIDEO_CODEC`] locator from a `kind` and a bare YouTube id.
+///
+/// `kind` is `"video"` | `"playlist"` | `"channel"`; `id` is the bare
+/// identifier (`4D7u5KF7SP8`, `OLAK5uy_…`, `UCRr1xG_2WIDs18a6cIiCxeA`) — **not**
+/// a URL, and not a `watch?v=` fragment. The framing is byte-identical to
+/// [`compute_card_cid`] on purpose, so each of the seven rank/decode
+/// implementations extends a parser it already wrote rather than learning a
+/// novel shape.
+///
+/// Returns `None` on an empty field or a digest past the multihash budget —
+/// the caller drops that reference.
+pub fn compute_yt_video_cid(kind: &str, id: &str) -> Option<String> {
+    kinded_locator_cid(YT_VIDEO_CODEC, kind, id)
+}
+
+/// Encode an [`EXT_PLAY_CODEC`] locator from an `http(s)` URL.
+///
+/// The scheme check is not cosmetic: it is what keeps a `javascript:` or
+/// `data:` payload from ever reaching a client that will hand this string to
+/// an anchor or a new tab.
+pub fn compute_ext_play_cid(url: &str) -> Option<String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let digest = url.as_bytes();
+    if digest.is_empty() || digest.len() > CARD_LOCATOR_MAX_DIGEST {
+        return None;
+    }
+    Some(identity_locator_cid(EXT_PLAY_CODEC, digest))
+}
+
+/// Shared encoder for the `varint(len(kind)) ‖ kind ‖ id` locator framing used
+/// by [`compute_card_cid`] and [`compute_yt_video_cid`].
+fn kinded_locator_cid(codec: u64, kind: &str, id: &str) -> Option<String> {
+    if kind.is_empty() || id.is_empty() {
+        return None;
+    }
+    let kind_b = kind.as_bytes();
+    let id_b = id.as_bytes();
+
+    let mut digest = Vec::with_capacity(2 + kind_b.len() + id_b.len());
+    write_pb_varint(kind_b.len() as u64, &mut digest);
+    digest.extend_from_slice(kind_b);
+    digest.extend_from_slice(id_b);
+    if digest.len() > CARD_LOCATOR_MAX_DIGEST {
+        return None;
+    }
+    Some(identity_locator_cid(codec, &digest))
+}
+
+/// CIDv1 with an *identity* multihash:
+/// `[version=0x01][codec varint][mh=0x00][len varint][digest]`, base32lower.
+fn identity_locator_cid(codec: u64, digest: &[u8]) -> String {
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01);
+    write_pb_varint(codec, &mut wire);
+    wire.push(0x00); // multihash code: identity
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(digest);
+    format!("b{}", base32_lower_no_padding(&wire))
+}
+
+/// Custom multicodec for a **Usenet posting** identity (`nzb-posting`),
+/// minted from the article Message-IDs of a release we scanned ourselves.
+///
+/// Unlike [`NZB_RELEASE_CODEC`] (`0x1005`), this is **not** a locator: it
+/// embeds no indexer host, so any peer with a plain NNTP provider can fetch the
+/// articles — no `IndexerCred`, no `t=get` grab. That portability is the whole
+/// point of running our own header scanner.
+///
+/// It is also **not** fetchable by cid: the digest is over the Message-ID set,
+/// not over any block's bytes, so bitswap can never satisfy a want for it (the
+/// receiver derives a block's cid by hashing the block — see
+/// `beetswap::incoming_stream`). The `.nzb` manifest travels separately, as an
+/// ordinary sha2-256 IPFS cid in the record's `manifest` field. See
+/// `meta-gateway/docs/others/self-hosted-usenet-indexer-study.md` §5.
+pub const NZB_POSTING_CODEC: u64 = 0x1003;
+
+/// Mint an `nzb-posting` cid (`0x1003`) from a release's article Message-IDs.
+///
+/// # The normalisation rule IS the dedup contract
+///
+/// Mirrored verbatim in meta-share (`nzb/manifest.rs`), which re-derives this
+/// digest from the fetched manifest and rejects a mismatch. **Any change here
+/// must land on both sides together** — a drift silently makes every posting
+/// unplayable. The rule:
+///
+/// 1. Trim each id, and strip a surrounding `<…>` pair if present (NZB
+///    `<segment>` bodies carry the bare form, but be defensive — NNTP `BODY`
+///    re-adds the brackets).
+/// 2. Drop empties.
+/// 3. Deduplicate, then **sort** lexicographically by bytes.
+/// 4. Join with `\n` and SHA-256 the result.
+///
+/// Case is **preserved**: a Message-ID's local part is case-sensitive per RFC
+/// 5322, so lowercasing could collide two genuinely distinct articles.
+///
+/// Sorting is what makes the cid survive segment/file reordering between two
+/// NZBs of the same posting — the reason we hash the *id set* and never the raw
+/// `.nzb` bytes (the retired `0x1004` did the latter and broke dedup; see
+/// meta-share `nzb/mod.rs`).
+///
+/// **v1 scope:** every segment counts, par2 volumes included. Two NZBs for one
+/// posting that disagree about whether to bundle par2 therefore mint different
+/// cids. Acceptable while we are the only producer of these manifests; if a
+/// second producer ever appears, the fix is to filter par2 subjects here *and*
+/// in meta-share's mirror — do not do it on one side only.
+pub fn compute_nzb_posting_cid<S: AsRef<str>>(message_ids: &[S]) -> String {
+    let mut ids: Vec<&str> = message_ids
+        .iter()
+        .map(|s| {
+            let t = s.as_ref().trim();
+            t.strip_prefix('<')
+                .and_then(|r| r.strip_suffix('>'))
+                .unwrap_or(t)
+        })
+        .filter(|s| !s.is_empty())
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut hasher = Sha256::new();
+    for (i, id) in ids.iter().enumerate() {
+        if i > 0 {
+            hasher.update(b"\n");
+        }
+        hasher.update(id.as_bytes());
+    }
+    let digest: [u8; 32] = hasher.finalize().into();
+
+    // CIDv1: [version=0x01][codec varint][mh code=0x12 sha2-256][len=32][digest]
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01);
+    write_pb_varint(NZB_POSTING_CODEC, &mut wire);
+    wire.push(0x12); // multihash code: sha2-256
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(&digest);
+    format!("b{}", base32_lower_no_padding(&wire))
+}
+
 /// Compute a standard IPFS CIDv1 over `bytes`. Output matches kubo's
 /// `ipfs add --cid-version=1 --raw-leaves=true --chunker=size-262144
 /// --hash=sha2-256 <file>`.
@@ -457,6 +784,82 @@ mod tests {
     }
 
     #[test]
+    fn yt_video_cid_matches_golden_vector() {
+        // Pinned by `/cid-rank-vectors.json`'s `yt-video-locator` entry. The id
+        // is the real resolver output for Daft Punk / "Get Lucky" measured in
+        // the delegated-playback study §4.3.
+        assert_eq!(
+            compute_yt_video_cid("video", "4D7u5KF7SP8").unwrap(),
+            "bagecaaarav3gszdfn42ein3vgvfumn2tka4a"
+        );
+    }
+
+    #[test]
+    fn yt_video_cid_framing_matches_card_locator() {
+        // The two codecs share the `varint(len(kind)) || kind || id` framing on
+        // purpose, so every decoder extends a parser it already wrote. If this
+        // ever fails, the two shapes have drifted and §7.2 of docs/cid-formats.md
+        // is no longer true.
+        let yt = compute_yt_video_cid("tmdb", "tv:95479").unwrap();
+        let card = compute_card_cid("tmdb", "tv:95479").unwrap();
+        // Same digest, different codec => same length, differing only in the
+        // codec varint region.
+        assert_ne!(yt, card);
+        assert_eq!(yt.len(), card.len());
+    }
+
+    #[test]
+    fn yt_video_cid_is_a_pure_function_of_kind_and_id() {
+        // Convergence is the reason this is a codec and not a URL: two peers
+        // that resolve the same video must derive the same address offline.
+        assert_eq!(
+            compute_yt_video_cid("video", "4D7u5KF7SP8"),
+            compute_yt_video_cid("video", "4D7u5KF7SP8")
+        );
+        // ...and the kind is part of the identity, not decoration.
+        assert_ne!(
+            compute_yt_video_cid("video", "OLAK5uy_kZ8Xq"),
+            compute_yt_video_cid("playlist", "OLAK5uy_kZ8Xq")
+        );
+    }
+
+    #[test]
+    fn yt_video_cid_rejects_empty_fields() {
+        assert!(compute_yt_video_cid("", "4D7u5KF7SP8").is_none());
+        assert!(compute_yt_video_cid("video", "").is_none());
+    }
+
+    #[test]
+    fn ext_play_cid_matches_golden_vector() {
+        assert_eq!(
+            compute_ext_play_cid("https://example.bandcamp.com/album/x").unwrap(),
+            "bagesaabenb2hi4dthixs6zlymfwxa3dffzrgc3temnqw24bomnxw2l3bnrrhk3jppa"
+        );
+    }
+
+    #[test]
+    fn ext_play_cid_rejects_non_http_schemes() {
+        // Load-bearing: a client hands this string to an anchor or a new tab,
+        // so a `javascript:` or `data:` payload must never mint a locator.
+        assert!(compute_ext_play_cid("javascript:alert(1)").is_none());
+        assert!(compute_ext_play_cid("data:text/html,<script>").is_none());
+        assert!(compute_ext_play_cid("ftp://example.com/x").is_none());
+        assert!(compute_ext_play_cid("").is_none());
+    }
+
+    #[test]
+    fn ext_play_cid_differs_from_the_url_locator_for_the_same_url() {
+        // The whole contract lives in the codec slot: `0x1006` means "fetch and
+        // seed these bytes", `0x1009` means "open this, there are no bytes for
+        // us". Wire-identical otherwise — which is exactly why a decoder that
+        // matched on *shape* would seed a Bandcamp page as the file.
+        let url = "https://example.bandcamp.com/album/x";
+        let ext = compute_ext_play_cid(url).unwrap();
+        let card = compute_card_cid("x", url).unwrap();
+        assert_ne!(ext, card);
+    }
+
+    #[test]
     fn ipfs_cid_single_leaf_matches_kubo() {
         assert_eq!(
             compute_ipfs_cid(b"hello world"),
@@ -517,5 +920,157 @@ mod tests {
         assert_eq!(out.blocks.len(), 1);
         assert_eq!(out.blocks[0].1.len(), 0);
         assert_eq!(out.blocks[0].0, out.root);
+    }
+
+    // ---- card locator (0x1007) --------------------------------------------
+
+    /// Inverse of [`base32_lower_no_padding`], test-only. Lets the card tests
+    /// assert the actual CIDv1 bytes (codec, multihash code, digest) rather
+    /// than just round-tripping the encoder against itself.
+    fn base32_lower_decode(s: &str) -> Vec<u8> {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut out = Vec::new();
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for c in s.bytes() {
+            let v = ALPHABET.iter().position(|&a| a == c).expect("base32 char") as u32;
+            acc = (acc << 5) | v;
+            bits += 5;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        out
+    }
+
+    /// The property the whole card design leans on: the CID is a pure function
+    /// of `(source, id)`, so any peer can derive a card's address offline. If
+    /// this literal ever changes, every already-published card silently forks
+    /// into a second identity — treat a failure here as a wire break.
+    #[test]
+    fn card_cid_is_deterministic() {
+        let cid = compute_card_cid("tmdb", "tv:95479").expect("card cid");
+        assert_eq!(cid, compute_card_cid("tmdb", "tv:95479").unwrap());
+        assert_eq!(cid, "bagdsaaanar2g2zdcor3duojvgq3ts");
+    }
+
+    /// Source- and kind-namespaced: the same numeric id on a different bridge,
+    /// or the same id under a different media kind, must not collide.
+    #[test]
+    fn card_cid_is_source_and_kind_namespaced() {
+        let tmdb = compute_card_cid("tmdb", "tv:95479").unwrap();
+        let mal = compute_card_cid("mal", "95479").unwrap();
+        let movie = compute_card_cid("tmdb", "movie:95479").unwrap();
+        assert_ne!(tmdb, mal);
+        assert_ne!(tmdb, movie);
+    }
+
+    /// Pins the on-the-wire CIDv1 layout: v1, codec `0x1007` (varint
+    /// `[0x87,0x20]`), **identity** multihash `0x00` (this family has no
+    /// digest — the locator itself is the payload), then
+    /// `varint(source_len) ‖ source ‖ id`.
+    #[test]
+    fn card_cid_wire_shape() {
+        let cid = compute_card_cid("tmdb", "tv:95479").unwrap();
+        assert!(cid.starts_with('b'), "multibase base32-lower prefix");
+        let wire = base32_lower_decode(&cid[1..]);
+
+        assert_eq!(wire[0], 0x01, "CIDv1");
+        assert_eq!(&wire[1..3], &[0x87, 0x20], "codec varint for 0x1007");
+        assert_eq!(wire[3], 0x00, "identity multihash — no digest");
+
+        let digest_len = wire[4] as usize;
+        let digest = &wire[5..5 + digest_len];
+        assert_eq!(digest[0], 4, "varint(len(\"tmdb\"))");
+        assert_eq!(&digest[1..5], b"tmdb");
+        assert_eq!(&digest[5..], b"tv:95479");
+    }
+
+    /// Empty inputs are rejected rather than encoded as an ambiguous locator,
+    /// and an id past the 64-byte multihash budget (meta-share's
+    /// `CidGeneric<64>`) returns `None` so the caller drops the card instead of
+    /// emitting a cid that peer would refuse to parse.
+    #[test]
+    fn card_cid_rejects_empty_and_oversized() {
+        assert!(compute_card_cid("", "tv:1").is_none());
+        assert!(compute_card_cid("tmdb", "").is_none());
+        let huge = "x".repeat(CARD_LOCATOR_MAX_DIGEST);
+        assert!(compute_card_cid("tmdb", &huge).is_none());
+        // Exactly at the ceiling still encodes.
+        let fits = "x".repeat(CARD_LOCATOR_MAX_DIGEST - 5); // varint(4) + "tmdb"
+        assert!(compute_card_cid("tmdb", &fits).is_some());
+    }
+
+    // ---- nzb-posting (0x1003) — the dedup contract -----------------------
+    //
+    // These pin the normalisation rule documented on `compute_nzb_posting_cid`.
+    // meta-share re-derives the same digest from the fetched manifest and
+    // rejects a mismatch, so a change that breaks one of these silently makes
+    // every self-scanned posting unplayable. Mirror any edit on both sides.
+
+    /// Segment/file **order must not matter** — that is the whole reason we
+    /// hash a sorted id set instead of the raw `.nzb` bytes (the retired
+    /// `0x1004` did the latter and broke dedup across reposts).
+    #[test]
+    fn nzb_posting_cid_is_order_independent() {
+        let a = ["c@x.com", "a@x.com", "b@x.com"];
+        let b = ["a@x.com", "b@x.com", "c@x.com"];
+        let c = ["b@x.com", "c@x.com", "a@x.com"];
+        assert_eq!(compute_nzb_posting_cid(&a), compute_nzb_posting_cid(&b));
+        assert_eq!(compute_nzb_posting_cid(&a), compute_nzb_posting_cid(&c));
+    }
+
+    /// Angle brackets, surrounding whitespace, empty entries and duplicates are
+    /// all normalised away. NZB `<segment>` bodies carry the bare form but NNTP
+    /// `BODY` re-adds the brackets, so both spellings must converge.
+    #[test]
+    fn nzb_posting_cid_normalises_brackets_blanks_and_dupes() {
+        let bare = ["a@x.com", "b@x.com"];
+        let noisy = [" <a@x.com> ", "b@x.com", "", "  ", "a@x.com"];
+        assert_eq!(
+            compute_nzb_posting_cid(&bare),
+            compute_nzb_posting_cid(&noisy)
+        );
+    }
+
+    /// Case is preserved: a Message-ID's local part is case-sensitive per RFC
+    /// 5322, so lowercasing could collide two genuinely distinct articles.
+    #[test]
+    fn nzb_posting_cid_is_case_sensitive() {
+        assert_ne!(
+            compute_nzb_posting_cid(&["Abc@x.com"]),
+            compute_nzb_posting_cid(&["abc@x.com"])
+        );
+    }
+
+    /// A different article set is a different posting.
+    #[test]
+    fn nzb_posting_cid_differs_on_different_ids() {
+        assert_ne!(
+            compute_nzb_posting_cid(&["a@x.com", "b@x.com"]),
+            compute_nzb_posting_cid(&["a@x.com", "c@x.com"])
+        );
+    }
+
+    /// Wire shape: CIDv1, codec `0x1003` (varint `[0x83, 0x20]`), multihash
+    /// sha2-256 (`0x12`), 32-byte digest. Pinned because meta-share matches on
+    /// the **codec** slot — a drift here makes every posting undecodable there.
+    #[test]
+    fn nzb_posting_cid_wire_shape() {
+        let cid = compute_nzb_posting_cid(&["a@x.com"]);
+        assert!(cid.starts_with('b'), "multibase base32-lower prefix");
+
+        // Round-trip the base32 body back to bytes to assert the header.
+        let decoded = base32_lower_decode(&cid[1..]);
+        assert_eq!(decoded[0], 0x01, "CIDv1");
+        assert_eq!(&decoded[1..3], &[0x83, 0x20], "varint(0x1003)");
+        assert_eq!(decoded[3], 0x12, "multihash sha2-256");
+        assert_eq!(decoded[4], 0x20, "digest length 32");
+        assert_eq!(decoded.len(), 5 + 32);
+
+        // The digest is sha256 over the newline-joined sorted set.
+        let expect: [u8; 32] = Sha256::digest(b"a@x.com").into();
+        assert_eq!(&decoded[5..], &expect);
     }
 }

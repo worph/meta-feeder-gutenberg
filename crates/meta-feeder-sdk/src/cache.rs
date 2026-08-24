@@ -53,6 +53,13 @@ const SUBTITLES_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("s
 /// OpenSubtitles search results keyed by `"<tmdb_id>\x01<lang3>"`. Value is the
 /// resolved subtitle's cid, or the literal `"null"` negative-cache sentinel.
 const OPENSUBTITLES_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("opensubtitles");
+/// Small durable plugin scratch values that must survive a restart but aren't
+/// content-derived — today, the torznab plugin's Prowlarr indexer-set
+/// fingerprint, so a set that changed *while the feeder was down* is still
+/// detected as a change on the next boot. Keys are plugin-namespaced
+/// (`prowlarr:indexer-set`). redb creates the table on open, so an older
+/// `.redb` file gains it transparently.
+const MISC_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("misc");
 
 /// Per-plugin midhash cache. Cheap to clone (the inner `Database` is shared
 /// via `Arc`).
@@ -105,12 +112,21 @@ impl MidhashCache {
             tx.open_table(TMDB_PRINCIPAL_TOPN_TABLE)?;
             tx.open_table(SUBTITLES_TABLE)?;
             tx.open_table(OPENSUBTITLES_TABLE)?;
+            tx.open_table(MISC_TABLE)?;
             tx.commit()?;
         }
         Ok(Self { db: Arc::new(db) })
     }
 
     str_table_accessors!(get_midhash, put_midhash, MIDHASH_TABLE);
+
+    str_table_accessors!(
+        /// Read a durable plugin scratch value (see [`MISC_TABLE`]).
+        get_misc,
+        /// Write a durable plugin scratch value (see [`MISC_TABLE`]).
+        put_misc,
+        MISC_TABLE,
+    );
 
     pub fn entry_count(&self) -> Result<u64, redb::Error> {
         let tx = self.db.begin_read()?;

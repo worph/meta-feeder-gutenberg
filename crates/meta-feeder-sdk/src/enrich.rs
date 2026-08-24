@@ -73,16 +73,40 @@ fn env_nonempty(key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Derive a co-bundled sidecar plugin URL from the feeder's own hostname, by the
+/// app-compose convention `<prefix>-feeder` → `<prefix>-<plugin>:8080`
+/// (e.g. `metafeedertorznab-feeder` → `http://metafeedertorznab-tmdb:8080`). Lets
+/// a feeder reach its bundled filename-parser / tmdb sidecars with **no explicit
+/// `*_PLUGIN_URL` env** — config lives in the UI, wiring is derived. Returns
+/// `None` when `HOSTNAME` is unset or not in `<prefix>-feeder` form, in which case
+/// the caller falls back to the env seed (then soft-skips that plugin).
+fn derive_sidecar_url(plugin: &str) -> Option<String> {
+    let host = env_nonempty("HOSTNAME")?;
+    let prefix = host.strip_suffix("-feeder")?;
+    Some(format!("http://{prefix}-{plugin}:8080"))
+}
+
 impl EnrichmentConfig {
     /// Parse from the feeder env. Returns `None` when `META_CORE_URL` is unset —
-    /// the feeder then falls back to the legacy "return record, gateway stores"
-    /// path (backward compatible; used by tests and gateway-stores deployments).
+    /// the **bundled-feeder** path (records returned over HTTP, the gateway
+    /// dispatcher stores them). Self-publishing feeders that source meta-core from
+    /// their own dashboard config use [`from_meta_core`](Self::from_meta_core).
     pub fn from_env() -> Option<Self> {
-        let meta_core_url = env_nonempty("META_CORE_URL")?;
-        Some(EnrichmentConfig {
+        Some(Self::from_meta_core(env_nonempty("META_CORE_URL")?))
+    }
+
+    /// Build with an explicit meta-core root — sourced from the feeder's own
+    /// `config.json` (dashboard) when set, else the `META_CORE_URL` env seed. The
+    /// sidecar URLs come from their `*_PLUGIN_URL` env, falling back to the
+    /// hostname-derived co-bundled sidecar (see [`derive_sidecar_url`]); the rest
+    /// keep their env seeds / defaults. Secrets (tmdb token, language) are
+    /// overlaid by the caller from the per-feeder config.
+    pub fn from_meta_core(meta_core_url: String) -> Self {
+        EnrichmentConfig {
             meta_core_url,
-            filename_parser_url: env_nonempty("FILENAME_PARSER_URL"),
-            tmdb_url: env_nonempty("TMDB_PLUGIN_URL"),
+            filename_parser_url: env_nonempty("FILENAME_PARSER_URL")
+                .or_else(|| derive_sidecar_url("filename-parser")),
+            tmdb_url: env_nonempty("TMDB_PLUGIN_URL").or_else(|| derive_sidecar_url("tmdb")),
             tmdb_token: env_nonempty("TMDB_TOKEN").or_else(|| env_nonempty("TORZNAB_TMDB_TOKEN")),
             tmdb_language: env_nonempty("TMDB_LANGUAGE").unwrap_or_else(|| "en-US".to_string()),
             gateway_peer: env_nonempty("META_GATEWAY_PEER_ID")
@@ -96,7 +120,7 @@ impl EnrichmentConfig {
             opensubtitles_password: env_nonempty("OPENSUBTITLES_PASSWORD"),
             opensubtitles_languages: env_nonempty("OPENSUBTITLES_LANGUAGES")
                 .unwrap_or_else(|| "en".to_string()),
-        })
+        }
     }
 }
 

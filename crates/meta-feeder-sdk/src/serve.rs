@@ -54,6 +54,10 @@ pub enum HashKindDto {
     Midhash256,
     Sha2_256,
     BtV1File,
+    NzbRelease,
+    CardLocator,
+    NzbPosting,
+    YtVideo,
 }
 
 impl From<HashKind> for HashKindDto {
@@ -62,6 +66,10 @@ impl From<HashKind> for HashKindDto {
             HashKind::Midhash256 => HashKindDto::Midhash256,
             HashKind::Sha2_256 => HashKindDto::Sha2_256,
             HashKind::BtV1File => HashKindDto::BtV1File,
+            HashKind::NzbRelease => HashKindDto::NzbRelease,
+            HashKind::CardLocator => HashKindDto::CardLocator,
+            HashKind::NzbPosting => HashKindDto::NzbPosting,
+            HashKind::YtVideo => HashKindDto::YtVideo,
         }
     }
 }
@@ -72,6 +80,10 @@ impl From<HashKindDto> for HashKind {
             HashKindDto::Midhash256 => HashKind::Midhash256,
             HashKindDto::Sha2_256 => HashKind::Sha2_256,
             HashKindDto::BtV1File => HashKind::BtV1File,
+            HashKindDto::NzbRelease => HashKind::NzbRelease,
+            HashKindDto::CardLocator => HashKind::CardLocator,
+            HashKindDto::NzbPosting => HashKind::NzbPosting,
+            HashKindDto::YtVideo => HashKind::YtVideo,
         }
     }
 }
@@ -424,8 +436,20 @@ async fn config_values_put(
     std::fs::write(&tmp, body)
         .and_then(|_| std::fs::rename(&tmp, &path))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("write config: {e}")).into_response())?;
-    info!(target: "meta-feeder", upstream_id = id, path = %path.display(), "feeder config saved (restart to apply)");
-    Ok(Json(serde_json::json!({ "saved": true, "restart_required": true })))
+    info!(target: "meta-feeder", upstream_id = id, path = %path.display(), "feeder config saved; scheduling self-restart to apply");
+    // Apply the new config by restarting the process. We can't hot-swap config
+    // in-place: plugins hold an exclusive redb cache handle for their whole life,
+    // so a fresh instance can't reopen the cache while the old one is alive. A
+    // clean process exit is the reliable apply path — Docker's restart policy
+    // (`unless-stopped`) brings the feeder back in ~2-3s and `configure()`
+    // re-reads config.json at startup. Delay briefly so THIS response flushes to
+    // the client before we exit.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        info!(target: "meta-feeder", "restarting now to apply saved config");
+        std::process::exit(0);
+    });
+    Ok(Json(serde_json::json!({ "saved": true, "reloading": true })))
 }
 
 /// `POST /enrich/callback` — sink for the enrichment plugins' completion
@@ -517,6 +541,10 @@ struct DegradedPlugin {
     reason: String,
     file_types: &'static [&'static str],
     content_kinds: &'static [&'static str],
+    /// Preserved from the wrapped plugin so a degraded/unconfigured feeder still
+    /// serves its config form — otherwise the dashboard shows "no configuration
+    /// required" and the operator can never fix the very config that's missing.
+    schema: crate::config::ConfigSchema,
 }
 
 #[async_trait::async_trait]
@@ -557,6 +585,10 @@ impl FeederPlugin for DegradedPlugin {
     fn served_content_kinds(&self) -> &'static [&'static str] {
         self.content_kinds
     }
+
+    fn config_schema(&self) -> crate::config::ConfigSchema {
+        self.schema.clone()
+    }
 }
 
 /// Run each plugin's `configure()` against its per-plugin cache dir and return
@@ -576,6 +608,9 @@ pub fn configure_plugins(
         // borrow across `configure(&mut self)` / the move into `out`.
         let file_types = plugin.served_file_types();
         let content_kinds = plugin.served_content_kinds();
+        // Preserve the config surface so a degraded stand-in still serves the
+        // real config form (see DegradedPlugin.schema).
+        let schema = plugin.config_schema();
         let cache_dir = state_dir.join("gateway").join(id);
 
         // Build (don't insert) a degraded stand-in: keeps the container up and
@@ -592,6 +627,7 @@ pub fn configure_plugins(
                 reason,
                 file_types,
                 content_kinds,
+                schema: schema.clone(),
             })
         };
 
@@ -606,12 +642,19 @@ pub fn configure_plugins(
                 out.insert(id.to_string(), Arc::from(plugin));
             }
             Err(ConfigError::MissingConfig { plugin: p, what }) => {
+                // Keep a degraded stand-in (don't drop it) so its config form
+                // stays reachable from the dashboard and the operator can supply
+                // the missing config — then restart the feeder to apply it.
                 warn!(
                     target: "meta-feeder",
-                    upstream_id = p,
-                    missing = what,
-                    "feeder plugin skipped: required config not supplied; \
-                     other plugins continue"
+                    upstream_id = %p,
+                    missing = %what,
+                    "feeder plugin degraded: required config not supplied; \
+                     config form still served so it can be fixed from the dashboard"
+                );
+                out.insert(
+                    id.to_string(),
+                    make_degraded(format!("required config not supplied: {what}")),
                 );
             }
             Err(other) => {

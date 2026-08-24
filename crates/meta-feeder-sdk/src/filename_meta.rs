@@ -57,9 +57,9 @@ pub struct SeasonEpisode {
     /// is deliberately **not** given a single `episode`.
     pub is_pack: bool,
     /// True when [`season`] came from an explicit season-bearing token
-    /// (`S01E05`, `Season 2`, `S03`), as opposed to the "episode with no
-    /// season → assume 1" default. Lets a per-file reparse know whether to
-    /// borrow the season from the pack/parent title (see
+    /// (`S01E05`, `Season 2`, `S03`). An episode with no such token is left
+    /// season-less (no "assume season 1" default), so a per-file reparse uses
+    /// this to know it should borrow the season from the pack/parent title (see
     /// [`extract_season_episode_with_context`]).
     pub season_explicit: bool,
 }
@@ -550,21 +550,22 @@ pub fn extract_season_episode(title: &str) -> SeasonEpisode {
 
     let mut out = SeasonEpisode::default();
     // season/episode 0 are valid; only < 0 means "not found".
-    let mut sea_eff = sea;
     if sea >= 0.0 {
         out.season = Some(fmt_num(sea));
         out.season_explicit = true;
     }
     if ep >= 0.0 {
         out.episode = Some(fmt_num(ep));
-        if sea_eff < 0.0 {
-            // An episode with no season — assume season 1 (matches TS). The
-            // season is *not* explicit, so a per-file reparse may override it
-            // from the parent (pack) title.
-            sea_eff = 1.0;
-            out.season = Some("1".to_string());
+        // An episode with no season is left season-LESS on purpose: a season is
+        // only asserted when explicitly hinted — an S-token in the title here,
+        // or (via extract_season_episode_with_context) the parent/pack title.
+        // Absolute-numbered releases ("Show - 28") thus carry an episode and no
+        // season, so the UI buckets them under "Episodes" rather than a
+        // fabricated "Season 1". `increment` encodes a season, so it is only
+        // emitted when the season is known.
+        if sea >= 0.0 {
+            out.increment = Some(fmt_num(sea * 10000.0 + ep));
         }
-        out.increment = Some(fmt_num(sea_eff * 10000.0 + ep));
     } else if sea >= 0.0 {
         // Season present, no episode → a whole-season pack (`Season 3`, `S03`).
         out.is_pack = true;
@@ -583,8 +584,8 @@ pub fn extract_season_episode(title: &str) -> SeasonEpisode {
 pub fn extract_season_episode_with_context(parent: &str, filename: &str) -> SeasonEpisode {
     let mut file_se = extract_season_episode(filename);
     // Only borrow the parent's season for a concrete single episode whose own
-    // filename carries no *explicit* season token (so its season is the assumed
-    // `1` default). A per-file record is an episode, not a pack, so we don't
+    // filename carries no *explicit* season token (so it is otherwise
+    // season-less). A per-file record is an episode, not a pack, so we don't
     // propagate the parent's pack/range shape here.
     if file_se.episode.is_some() && !file_se.season_explicit {
         if let Some(s) = find_pack_season(&preclean(parent)) {
@@ -1004,12 +1005,13 @@ mod tests {
     }
 
     #[test]
-    fn anime_trailing_number_assumes_season_one() {
-        // No season marker → episode via rightmost-number fallback,
-        // season assumed 1. SFV id stripped, brackets ignored.
+    fn anime_trailing_number_is_season_less() {
+        // No season marker → episode via rightmost-number fallback, and NO
+        // season is fabricated (absolute numbering). SFV id stripped, brackets
+        // ignored. The UI buckets a season-less episode under "Episodes".
         assert_eq!(
             se("[SubsPlease] Some Anime - 117 [FC412C51]"),
-            (Some("1".into()), Some("117".into()))
+            (None, Some("117".into()))
         );
     }
 
@@ -1184,8 +1186,8 @@ mod tests {
     #[test]
     fn per_file_context_recovers_season_from_parent() {
         // Opened pack: the inner file carries the episode, the pack title the
-        // season. `Frieren - 03.mkv` alone assumes S1; with the S2 pack parent
-        // it resolves to S2E3.
+        // season. `Frieren - 03.mkv` alone is season-less; with the S2 pack
+        // parent it resolves to S2E3 (the parent is the "season hint").
         let r = extract_season_episode_with_context("Frieren S2 (01-10) [Batch]", "Frieren - 03.mkv");
         assert_eq!(r.season.as_deref(), Some("2"));
         assert_eq!(r.episode.as_deref(), Some("3"));
@@ -1198,12 +1200,14 @@ mod tests {
     }
 
     #[test]
-    fn absolute_numbered_anime_still_assumes_season_one() {
-        // No season keyword → the rightmost-number fallback still fires, season
-        // assumed 1 (Phase 3 remaps this against TMDB episode counts later).
+    fn absolute_numbered_anime_is_season_less() {
+        // No season keyword → the rightmost-number fallback still finds the
+        // episode, but NO season is fabricated. Season is only ever asserted
+        // from an explicit token (title or parent), never inferred — so an
+        // absolute-numbered release lands in the UI's "Episodes" bucket.
         assert_eq!(
             se("[Naruto-Kun.Hu] Spy x Family - 37 [1080p].mkv"),
-            (Some("1".into()), Some("37".into()))
+            (None, Some("37".into()))
         );
     }
 

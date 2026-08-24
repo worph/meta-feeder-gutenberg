@@ -17,6 +17,7 @@
   .field { margin: 0 0 16px; }
   .field > label { display: block; font-weight: 600; margin: 0 0 4px; }
   .help { color: #8a8a96; font-size: 12px; margin: 3px 0 0; }
+  .req { color: #f0a0a0; margin-left: 3px; font-weight: 700; }
   input[type=text], input[type=password], input[type=number], textarea {
     width: 100%; padding: 8px 10px; border-radius: 8px;
     border: 1px solid #2a2a35; background: #15151c; color: #e6e6ea; font: inherit;
@@ -46,7 +47,7 @@
 </head>
 <body>
   <h1 id="title">Plugin configuration</h1>
-  <p class="sub">Secrets are write-only — set values are shown as “set”, never echoed back. Saving requires a feeder restart to take effect.</p>
+  <p class="sub">Secrets are write-only — set values are shown as “set”, never echoed back. Saving requires a feeder restart to take effect. Fields marked <span class="req">*</span> are required.</p>
   <div id="banner" class="banner"></div>
   <form id="form"></form>
   <div class="bar" id="bar" style="display:none">
@@ -102,15 +103,24 @@ function linkify(text) {
 
 function helpEl(f) { return f.help ? el("p", { class: "help" }, ...linkify(f.help)) : null; }
 
+// A "*" marker for required fields (null for optional ones).
+function reqStar(f) { return f.required ? el("span", { class: "req", text: "*", title: "required" }) : null; }
+
 // Render one scalar field. `vals` is the object holding the value/`_set` flag.
+// Every returned widget exposes `_collect()` and `_key` so collect() can read it.
 function fieldInput(f, vals) {
   if (f.type === "bool") {
     const cb = el("input", { type: "checkbox" });
     cb.checked = vals[f.key] === true;
-    cb._get = () => cb.checked;
-    return el("label", {}, cb, " ", el("span", { text: " " + f.label }));
+    const w = el("div", { class: "field" },
+      el("label", {}, cb, " ", el("span", { text: " " + f.label }), reqStar(f)),
+      helpEl(f));
+    w._collect = () => cb.checked;
+    w._key = f.key;
+    return w;
   }
   const label = el("label", { text: f.label });
+  const star = reqStar(f); if (star) label.append(star);
   let input;
   if (f.type === "secret") {
     const isSet = vals[f.key + "_set"] === true;
@@ -134,14 +144,6 @@ function fieldInput(f, vals) {
   const wrap = el("div", { class: "field" }, label, input, helpEl(f));
   wrap._collect = () => input._get();
   wrap._key = f.key;
-  // bool path returns a <label>; normalize collect/key for it
-  if (f.type === "bool") {
-    const w = el("div", { class: "field" }, label, helpEl(f));
-    const cb = label.querySelector("input");
-    w._collect = () => cb.checked;
-    w._key = f.key;
-    return w;
-  }
   return wrap;
 }
 
@@ -175,8 +177,9 @@ function recordArray(f, vals) {
   const add = el("button", { type: "button", class: "add", text: "+ add " + f.label.toLowerCase().replace(/s$/, "") });
   add.onclick = () => addRecord({});
 
-  const wrap = el("div", { class: "field" },
-    el("label", { text: f.label }), helpEl(f), list, add);
+  const lbl = el("label", { text: f.label });
+  const star = reqStar(f); if (star) lbl.append(star);
+  const wrap = el("div", { class: "field" }, lbl, helpEl(f), list, add);
   wrap._key = f.key;
   wrap._collect = () => Array.from(list.children).map((c) => c._collect());
   return wrap;
@@ -215,14 +218,34 @@ async function save() {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(collect()),
     });
-    if (!res.ok) throw new Error((await res.text()) || res.status);
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => "")).trim();
+      throw new Error(detail ? `the feeder rejected it (HTTP ${res.status}): ${detail}`
+                             : `the feeder returned HTTP ${res.status}`);
+    }
     const j = await res.json().catch(() => ({}));
-    if (j.restart_required) banner("warn", "Saved. Restart the feeder container for changes to take effect.");
-    else banner("ok", "Saved.");
-    // Re-fetch so secret pills reflect the new stored state.
-    await load();
+    if (j.reloading) {
+      // The feeder is restarting itself (~2-3s) to apply the change. Poll it
+      // back up, then refresh the form so secret pills reflect stored state.
+      banner("warn", "Saved — reloading the feeder to apply (~3 s)…");
+      let tries = 6;
+      const poll = async () => {
+        try { await load(); banner("ok", "Reloaded — new config applied."); }
+        catch { if (--tries > 0) setTimeout(poll, 1500); else banner("warn", "Saved & reloading — reopen this panel shortly to confirm."); }
+      };
+      setTimeout(poll, 3000);
+    } else {
+      if (j.restart_required) banner("warn", "Saved. Restart the feeder container for changes to take effect.");
+      else banner("ok", "Saved.");
+      // Re-fetch so secret pills reflect the new stored state.
+      await load();
+    }
   } catch (e) {
-    banner("err", "Save failed: " + e.message);
+    const msg = (e && e.message) ? e.message : String(e);
+    const friendly = /Failed to fetch|NetworkError|load failed/i.test(msg)
+      ? "couldn't reach the feeder — it may be restarting; wait a moment and try again."
+      : msg;
+    banner("err", "Could not save: " + friendly);
   } finally {
     $("save").disabled = false;
   }
