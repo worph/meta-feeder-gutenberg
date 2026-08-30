@@ -433,6 +433,9 @@ fn into_discovery_record(
     fields.insert("title".into(), title);
     fields.insert("fileType".into(), "document".into());
     fields.insert("contentKind".into(), "book".into());
+    // A book's identity graph is Gutenberg/ISBN → `literature`
+    // (METADATA_KEYS.md §1). Written with the kind, never derived on read.
+    fields.insert("domain".into(), "literature".into());
     fields.insert(
         "sourceUrl".into(),
         format!("https://www.gutenberg.org/ebooks/{id}"),

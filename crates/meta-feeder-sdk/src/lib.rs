@@ -24,6 +24,7 @@ pub const DEFAULT_META_CORE_URL: &str = "http://metacore-app:9000";
 pub mod cache;
 pub mod common;
 pub mod config;
+pub mod domain;
 pub mod enrich;
 pub mod filename_meta;
 pub mod hash;
