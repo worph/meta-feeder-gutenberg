@@ -468,9 +468,39 @@ fn into_discovery_record(
     if let Some(cid) = cover_cid {
         fields.insert("poster".into(), cid);
     }
+    // ⚠ `poster` alone is a CID with no bytes behind it anywhere on the mesh.
+    //
+    // The cover is fetched and hashed here, but the bytes only ever land in this
+    // feeder's own redb blob cache (served at `/blob/gutenberg/<cid>`). Nothing
+    // pulls them from there into a blockstore, so every client asks for a CID no
+    // peer holds and every cover renders blank — measured: `/api/image/<cid>`
+    // → 504, and `.../raw` → 404 on both the client and the gateway peer.
+    //
+    // The gateway's seed path is keyed on the `*_url` convention:
+    // `SEEDABLE_FIELDS` (meta-gateway `remote_feeder.rs:177`) maps
+    // `poster_url` → fetch → hash → seed into the blockstore → rewrite the
+    // record's `poster` to the resulting content cid. Emitting the upstream URL
+    // is what enrols this feeder in that path; the `poster` above then gets
+    // overwritten with an identical, and crucially *backed*, cid.
+    if let Some(url) = formats.get("image/jpeg") {
+        fields.insert("poster_url".into(), url.clone());
+    }
     if formats.contains_key(EPUB_FORMAT) {
         fields.insert("format".into(), "epub".into());
     }
+    // ⚠ This record carries NO `cids/` member, and that is why the tier behaves
+    // as "the first search works, every repeat within the hour returns nothing".
+    // The gateway keys its store-back on `url_key_for` (meta-gateway
+    // `dispatch.rs`) and skips any record without one, while the search-coverage
+    // gate still marks (gutenberg, query) covered — so nothing is ever persisted
+    // and the gate then serves the empty meta-core. Measured: the gateway's
+    // meta-core held zero /file records ("meta-core poll: nothing new,
+    // scanned=0") after hundreds of results.
+    //
+    // The fix is the fleet convention — `cids/<compute_url_cid(epub_url)>`, as
+    // meta-feeder-internetarchive and -jamendo both do — but THIS repo vendors
+    // an older SDK copy at crates/meta-feeder-sdk that predates
+    // `compute_url_cid`. Stamping it needs that vendored copy upgraded first.
     if let Some(c) = copyright {
         fields.insert("publicDomain".into(), (!c).to_string());
     }
