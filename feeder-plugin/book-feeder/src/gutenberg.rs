@@ -465,9 +465,19 @@ fn into_discovery_record(
     if let Some(mt) = media_type {
         fields.insert("mediaType".into(), mt);
     }
-    if let Some(cid) = cover_cid {
-        fields.insert("poster".into(), cid);
-    }
+    // ⚠ Deliberately NOT stamping a self-computed `poster`.
+    //
+    // This feeder hashes the cover itself and used to stamp the result. Two
+    // things were wrong with that. The bytes only ever reached its own redb blob
+    // cache, so the cid named data no peer on the mesh held — and the cid it
+    // produced was malformed anyway: 50 characters where a raw sha2-256 CIDv1 is
+    // 59, so `/api/image/<cid>` 504'd even once a real seed existed, because the
+    // stale field won over the gateway's rewrite.
+    //
+    // `poster_url` below is the whole contract: the gateway's SEEDABLE_FIELDS
+    // path fetches it, hashes the bytes, seeds them into the blockstore and
+    // writes the resulting content cid back as `poster`.
+    let _ = cover_cid;
     // ⚠ `poster` alone is a CID with no bytes behind it anywhere on the mesh.
     //
     // The cover is fetched and hashed here, but the bytes only ever land in this
@@ -485,22 +495,32 @@ fn into_discovery_record(
     if let Some(url) = formats.get("image/jpeg") {
         fields.insert("poster_url".into(), url.clone());
     }
-    if formats.contains_key(EPUB_FORMAT) {
+    if let Some(epub_url) = formats.get(EPUB_FORMAT) {
         fields.insert("format".into(), "epub".into());
+        // ⚠ Without a `cids/` member this record is SILENTLY DISCARDED.
+        //
+        // The gateway keys its store-back on `url_key_for` (meta-gateway
+        // `dispatch.rs`) and skips any record that has none — while the
+        // search-coverage gate still marks (gutenberg, query) covered for an
+        // hour. Together that produced the tier's long-standing behaviour: the
+        // first search answers from the live fan-out, nothing is ever
+        // persisted, and every repeat inside the window is served from an empty
+        // meta-core. Measured: the gateway's meta-core held zero /file records
+        // ("meta-core poll: nothing new, scanned=0") after hundreds of results,
+        // which also meant no poster was ever seeded and every cover was blank.
+        //
+        // A `0x1006` url-locator over the download URL is the fleet convention —
+        // meta-feeder-internetarchive and -jamendo both stamp
+        // `cids/<compute_url_cid(url)>`. It costs no I/O (the cid is a pure
+        // function of the URL string) and doubles as the byte path: meta-share
+        // redeems the locator on demand.
+        //
+        // ⚠ Exactly ONE `cids/` member. `url_key_for` takes the lexicographic
+        // `.min()`, so a second cid would make the store key arbitrary.
+        if let Some(cid) = meta_feeder_sdk::hash::compute_url_cid(epub_url) {
+            fields.insert(format!("cids/{cid}"), "true".into());
+        }
     }
-    // ⚠ This record carries NO `cids/` member, and that is why the tier behaves
-    // as "the first search works, every repeat within the hour returns nothing".
-    // The gateway keys its store-back on `url_key_for` (meta-gateway
-    // `dispatch.rs`) and skips any record without one, while the search-coverage
-    // gate still marks (gutenberg, query) covered — so nothing is ever persisted
-    // and the gate then serves the empty meta-core. Measured: the gateway's
-    // meta-core held zero /file records ("meta-core poll: nothing new,
-    // scanned=0") after hundreds of results.
-    //
-    // The fix is the fleet convention — `cids/<compute_url_cid(epub_url)>`, as
-    // meta-feeder-internetarchive and -jamendo both do — but THIS repo vendors
-    // an older SDK copy at crates/meta-feeder-sdk that predates
-    // `compute_url_cid`. Stamping it needs that vendored copy upgraded first.
     if let Some(c) = copyright {
         fields.insert("publicDomain".into(), (!c).to_string());
     }

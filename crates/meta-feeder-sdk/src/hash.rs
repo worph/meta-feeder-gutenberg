@@ -246,6 +246,39 @@ fn decode_hex_id(id: &str) -> Option<Vec<u8>> {
 /// * It ranks `RANK_LOCATOR` (5), so it can never outrank a real digest for
 ///   `canonical_cid` — which is what makes the future "one card, two CIDs"
 ///   merge (a TMDB and a MyAnimeList locator on one meta-core record) safe.
+/// The `url` locator codec (`0x1006`).
+///
+/// ⚠ Back-ported into this vendored SDK copy because the shared crate has it and
+/// this one predates it. Keep it byte-identical to
+/// `meta-feeder-sdk::hash::compute_url_cid`: it is how a record gets an address
+/// without the feeder ever fetching bytes, and two encoders disagreeing would
+/// mint two cids for one URL.
+pub const URL_LOCATOR_CODEC: u64 = 0x1006;
+
+/// Encode an `http(s)` URL as a `0x1006` identity-multihash CIDv1.
+///
+/// The digest IS the URL bytes, so this costs no I/O and no lookup — which is
+/// what makes it usable at search time, on every record, before anything has
+/// been fetched. Resolution happens later, on whichever peer wants the bytes.
+///
+/// `None` for anything that is not an absolute http(s) URL: a relative or
+/// malformed value would encode fine and then fail unresolvably at read time,
+/// which is a far more expensive way to find out.
+pub fn compute_url_cid(url: &str) -> Option<String> {
+    let u = url.trim();
+    if !(u.starts_with("http://") || u.starts_with("https://")) {
+        return None;
+    }
+    let digest = u.as_bytes();
+    let mut wire = Vec::with_capacity(1 + 3 + 2 + digest.len());
+    wire.push(0x01); // CIDv1
+    write_pb_varint(URL_LOCATOR_CODEC, &mut wire);
+    wire.push(0x00); // multihash code: identity
+    write_pb_varint(digest.len() as u64, &mut wire);
+    wire.extend_from_slice(digest);
+    Some(format!("b{}", base32_lower_no_padding(&wire)))
+}
+
 pub const CARD_LOCATOR_CODEC: u64 = 0x1007;
 
 /// Digest byte ceiling for a card locator, matching meta-share's
