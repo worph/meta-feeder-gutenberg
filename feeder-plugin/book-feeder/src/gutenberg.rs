@@ -38,6 +38,27 @@ const HTTP_TIMEOUT_SECS: u64 = 30;
 /// User-Agent string sent on every Gutendex request.
 const USER_AGENT: &str = concat!("meta-share/", env!("CARGO_PKG_VERSION"), " (gateway:gutenberg)");
 
+/// Attempts per Gutendex call before a transport failure is reported as
+/// transient.
+///
+/// ⚠ **A browse row has no way to say "the upstream blinked".** It renders the
+/// records it got, and one dropped connection turns "Free & Public Domain" into
+/// an empty shelf that reads as *there are no public-domain books* — the exact
+/// impression this whole tier exists to prevent. Measured against the live
+/// service from this stack, roughly one call in three failed at the transport
+/// layer (`error sending request`) while the very next succeeded, so a single
+/// attempt is not enough to put a stable row on screen.
+///
+/// Three, not more: the failures are connection-level and fast, and the caller
+/// is a live user-facing fan-out already bounded by a 15 s idle cutoff. This is
+/// deliberately NOT a retry of 4xx/5xx or rate-limiting — `map_status` still
+/// classifies those, and retrying a 429 would be the wrong thing entirely.
+const SEARCH_ATTEMPTS: usize = 3;
+
+/// Backoff between those attempts. Short: a transport blink recovers
+/// immediately, and anything longer eats the caller's idle budget.
+const RETRY_BACKOFF_MS: u64 = 250;
+
 /// Gutenberg gateway plugin. Cheap to construct; `configure()` opens the
 /// per-plugin redb cache.
 pub struct GutenbergPlugin {
@@ -67,15 +88,50 @@ impl GutenbergPlugin {
         common::require_cache(self.cache.as_ref(), "gutenberg")
     }
 
-    /// GET `{base}/books/{id}`; map HTTP/JSON failures to `GatewayError`.
+    /// GET `url` (with optional query pairs), retrying a **transport** failure up
+    /// to [`SEARCH_ATTEMPTS`] times.
+    ///
+    /// Only `reqwest::Error` from `send()` is retried — a connection reset, a DNS
+    /// blip, a TLS handshake that died. A response that arrives is handed
+    /// straight to `map_status`, so 404 stays `NotFound`, 429 stays
+    /// `RateLimited`, and a 5xx stays a single transient rather than three
+    /// hits on an upstream that is already struggling.
+    async fn get_retrying(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+    ) -> Result<reqwest::Response, GatewayError> {
+        let mut last = String::new();
+        for attempt in 1..=SEARCH_ATTEMPTS {
+            match self.http.get(url).query(query).send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    last = e.to_string();
+                    warn!(
+                        target: "meta-share::gateway",
+                        upstream = "gutenberg",
+                        url,
+                        attempt,
+                        of = SEARCH_ATTEMPTS,
+                        error = %last,
+                        "gutendex transport failure; retrying"
+                    );
+                    if attempt < SEARCH_ATTEMPTS {
+                        tokio::time::sleep(std::time::Duration::from_millis(RETRY_BACKOFF_MS))
+                            .await;
+                    }
+                }
+            }
+        }
+        Err(GatewayError::Transient(format!(
+            "GET {url}: {last} (after {SEARCH_ATTEMPTS} attempts)"
+        )))
+    }
+
+    /// GET `{base}/books/{id}/`; map HTTP/JSON failures to `GatewayError`.
     async fn fetch_book(&self, record_id: &str) -> Result<GutendexBook, GatewayError> {
         let url = format!("{}/books/{}", self.base_url.trim_end_matches('/'), record_id);
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| GatewayError::Transient(format!("GET {url}: {e}")))?;
+        let resp = self.get_retrying(&url, &[]).await?;
         common::map_status(&resp)?;
         resp.json::<GutendexBook>()
             .await
@@ -310,15 +366,33 @@ impl FeederPlugin for GutenbergPlugin {
         ) {
             return Ok(Vec::new());
         }
-        let q = query.free_text_or_star();
-        let url = format!("{}/books", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .get(&url)
-            .query(&[("search", q)])
-            .send()
-            .await
-            .map_err(|e| GatewayError::Transient(format!("GET {url}: {e}")))?;
+        // ⚠ **The trailing slash is not cosmetic.** Gutendex 301s `/books` to
+        // `/books/`, so every single search paid for two round trips and an extra
+        // connection that could fail on its own. `/books/{id}` above already used
+        // the canonical form; the search path did not.
+        let url = format!("{}/books/", self.base_url.trim_end_matches('/'));
+
+        // ⚠ **A browse query must NOT send `search=*`.**
+        //
+        // `free_text_or_star()` exists for upstreams where `*` means "everything".
+        // Gutendex is not one of them: it treats the asterisk as a **literal**,
+        // so `?search=*` returns the four books with a `*` in their title —
+        // "The Seri Indians. (1898 N 17 / 1895-1896 (pages 1-344*))" and friends.
+        // That is what the "Free & Public Domain" row had been asking for, which
+        // is why a shelf backed by 79,296 public-domain books rendered as either
+        // empty or three pieces of 19th-century ethnography.
+        //
+        // Omitting the parameter is the catalogue browse: `/books/` returns
+        // everything, already ordered by download count (identical to
+        // `?sort=popular`), so the row leads with Pride and Prejudice rather than
+        // with whatever happens to contain punctuation.
+        let q = query.free_text.trim();
+        let params: Vec<(&str, &str)> = if q.is_empty() {
+            Vec::new()
+        } else {
+            vec![("search", q)]
+        };
+        let resp = self.get_retrying(&url, &params).await?;
         common::map_status(&resp)?;
         let body: GutendexSearch = resp.json().await.map_err(|e| {
             GatewayError::Permanent(format!("decode gutendex search response: {e}"))
@@ -326,7 +400,7 @@ impl FeederPlugin for GutenbergPlugin {
         debug!(
             target: "meta-share::gateway",
             upstream = "gutenberg",
-            query = q,
+            query = if q.is_empty() { "<catalogue browse>" } else { q },
             count = body.results.len(),
             "search returned"
         );
@@ -523,6 +597,22 @@ fn into_discovery_record(
     }
     if let Some(c) = copyright {
         fields.insert("publicDomain".into(), (!c).to_string());
+        // ⚠ `licence` is **required on every record from a free-tier upstream**
+        // (METADATA_KEYS `licence`), and Gutenberg is the archetypal one. Omitting
+        // it was not a cosmetic gap: consumers filter the free tier ON this field
+        // — meta-read's "Free & Public Domain" row asks for `licence:pd` — so a
+        // catalogue of 79,296 public-domain books was invisible to the one row
+        // built to show it, while its own seeded fixture (which does carry the
+        // field) sat there looking like the whole corpus.
+        //
+        // `PublicDomain` is the registry's own spelling. `publicDomain` above
+        // stays: it is the upstream's raw boolean, and the registry is explicit
+        // that absence of `licence` means *unknown*, never *unrestricted* — so a
+        // book Gutendex reports as still in copyright gets neither field
+        // asserting freedom.
+        if !c {
+            fields.insert("licence".into(), "PublicDomain".into());
+        }
     }
     let _ = download_count;
     fields.insert("fileName".into(), format!("gutenberg-{id}.epub"));
@@ -760,6 +850,11 @@ mod tests {
                     "title": "Pride and Prejudice",
                     "authors": [{"name": "Austen, Jane", "birth_year": 1775, "death_year": 1817}],
                     "languages": ["en"],
+                    // ⚠ The live API returns this on every result and the
+                    // fixture omitted it, so `publicDomain` / `licence` were
+                    // silently untested — the exact fields the free-tier rows
+                    // filter on.
+                    "copyright": false,
                     "formats": {
                         "application/epub+zip": "EPUB_URL_PLACEHOLDER",
                         "text/plain; charset=utf-8": "https://www.gutenberg.org/files/1342/1342-0.txt"
@@ -770,6 +865,7 @@ mod tests {
                     "title": "Frankenstein; Or, The Modern Prometheus",
                     "authors": [{"name": "Shelley, Mary Wollstonecraft", "birth_year": 1797, "death_year": 1851}],
                     "languages": ["en"],
+                    "copyright": false,
                     "formats": {
                         "application/epub+zip": "EPUB_URL_PLACEHOLDER",
                         "text/plain; charset=utf-8": "https://www.gutenberg.org/files/84/84-0.txt"
@@ -786,11 +882,181 @@ mod tests {
         (plugin, dir)
     }
 
+    /// ⚠ The search path must ask for the CANONICAL `/books/`.
+    ///
+    /// Gutendex 301s `/books` → `/books/`. Following a redirect is free in
+    /// correctness terms and invisible in a test that mounts both, which is
+    /// exactly why this asserts the path the client actually requests: two round
+    /// trips per search, on a live user-facing fan-out, is a cost nobody would
+    /// choose deliberately.
+    #[tokio::test]
+    async fn search_requests_the_canonical_slashed_path() {
+        let server = MockServer::start().await;
+        // ONLY the slashed form is mounted; the bare form 404s the way a
+        // redirect-less client would notice.
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .and(query_param("search", "alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let records = plugin
+            .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+            .await
+            .expect("handle_query against the slashed path");
+        assert_eq!(records.len(), 2);
+    }
+
+    /// ⚠ Every public-domain record must carry `licence`.
+    ///
+    /// METADATA_KEYS makes it **required on every record from a free-tier
+    /// upstream**, and consumers filter the free tier on it. Without it a
+    /// public-domain catalogue is invisible to the very rows built to show it.
+    #[tokio::test]
+    async fn a_public_domain_book_carries_the_licence_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let records = plugin
+            .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+            .await
+            .expect("handle_query");
+        let f = &records[0].fields;
+        // The registry's own spelling, not a private shorthand.
+        assert_eq!(f.get("licence").map(String::as_str), Some("PublicDomain"));
+        // The raw upstream boolean stays alongside it.
+        assert_eq!(f.get("publicDomain").map(String::as_str), Some("true"));
+    }
+
+    /// ⚠ A browse query must not ask Gutendex for a literal asterisk.
+    ///
+    /// `free_text_or_star()` is right for upstreams where `*` means "everything".
+    /// Gutendex matches it literally, so `?search=*` returns the four books with
+    /// an asterisk in the title — which is what the "Free & Public Domain" row
+    /// was rendering instead of a public-domain catalogue.
+    #[tokio::test]
+    async fn a_filters_only_query_browses_the_catalogue_instead_of_searching_for_a_star() {
+        let server = MockServer::start().await;
+        // ⚠ `query_param_is_missing` is the assertion. Mounting a catch-all and
+        // checking the records would pass just as happily against `search=*`.
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .and(wiremock::matchers::query_param_is_missing("search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let browse = GatewayQuery {
+            raw_text: "domain:literature contentKind:book licence:pd".to_string(),
+            free_text: String::new(),
+            filters: [("contentKind".to_string(), vec!["book".to_string()])]
+                .into_iter()
+                .collect(),
+            ranges: Vec::new(),
+            negations: Vec::new(),
+        };
+        let records = plugin.handle_query(&browse, 50).await.expect("browse");
+        assert_eq!(records.len(), 2, "the catalogue browse must return records");
+    }
+
+    /// Whitespace-only free text is a browse, not a search for spaces.
+    #[tokio::test]
+    async fn blank_free_text_is_treated_as_a_browse() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .and(wiremock::matchers::query_param_is_missing("search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let mut q = GatewayQuery::from_free_text("   ");
+        q.filters
+            .insert("contentKind".to_string(), vec!["book".to_string()]);
+        assert_eq!(plugin.handle_query(&q, 50).await.expect("browse").len(), 2);
+    }
+
+    /// ⚠ One dropped connection must not empty a browse row.
+    ///
+    /// Measured against the live service, roughly one call in three failed at the
+    /// transport layer while the next succeeded. Without a retry that renders as
+    /// "there are no public-domain books", with nothing in the UI to say
+    /// otherwise — a silent, wrong, and very believable empty shelf.
+    #[tokio::test]
+    async fn a_transport_failure_is_retried_rather_than_emptying_the_row() {
+        // wiremock cannot sever a connection, so the failure is produced the one
+        // way a client sees as a transport error rather than a status: the first
+        // call goes to a dead port, the retry to the live server. Driving that
+        // through `get_retrying` directly keeps the assertion on the retry
+        // itself.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+        let (plugin, _dir) = configured_plugin_against(&server);
+
+        // A port nothing is listening on: `send()` fails before any response.
+        let dead = "http://127.0.0.1:1/books/";
+        let err = plugin
+            .get_retrying(dead, &[])
+            .await
+            .expect_err("a dead port cannot succeed");
+        match err {
+            GatewayError::Transient(m) => assert!(
+                m.contains(&format!("after {SEARCH_ATTEMPTS} attempts")),
+                "a transport failure must report as transient AFTER exhausting the \
+                 budget, so the caller can tell a blink from an outage; got: {m}"
+            ),
+            other => panic!("expected Transient, got {other:?}"),
+        }
+
+        // And a reachable server still answers on the first attempt.
+        let resp = plugin
+            .get_retrying(&format!("{}/books/", server.uri()), &[])
+            .await
+            .expect("live server answers");
+        assert!(resp.status().is_success());
+    }
+
+    /// ⚠ A 404 must NOT be retried three times.
+    ///
+    /// The retry exists for connections that never delivered a response. A
+    /// response that arrives — 404, 429, 5xx — is `map_status`'s business, and
+    /// retrying a rate-limit is actively harmful to the upstream that is already
+    /// throttling us.
+    #[tokio::test]
+    async fn a_status_response_is_not_retried() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/404404"))
+            .respond_with(ResponseTemplate::new(404))
+            // `expect(1)` is the assertion: wiremock panics on drop if the
+            // endpoint was hit more than once.
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let err = plugin.fetch_book("404404").await.expect_err("404");
+        assert!(matches!(err, GatewayError::NotFound), "got {err:?}");
+    }
+
     #[tokio::test]
     async fn handle_query_maps_results_to_discovery_records() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/books"))
+            .and(path("/books/"))
             .and(query_param("search", "alice"))
             .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
             .mount(&server)
@@ -830,7 +1096,7 @@ mod tests {
     async fn handle_query_truncates_to_max_results() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/books"))
+            .and(path("/books/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
             .mount(&server)
             .await;
@@ -958,7 +1224,7 @@ mod tests {
     async fn upstream_5xx_maps_to_transient() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/books"))
+            .and(path("/books/"))
             .respond_with(ResponseTemplate::new(502))
             .mount(&server)
             .await;
@@ -975,7 +1241,7 @@ mod tests {
     async fn upstream_429_maps_to_rate_limited_with_retry_after() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path("/books"))
+            .and(path("/books/"))
             .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "90"))
             .mount(&server)
             .await;

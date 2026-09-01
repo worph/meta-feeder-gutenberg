@@ -68,7 +68,7 @@ async fn manifest_lists_book_capabilities() {
 async fn query_returns_gutenberg_records() {
     let upstream = MockServer::start().await;
     Mock::given(method("GET"))
-        .and(path("/books"))
+        .and(path("/books/"))
         .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
         .mount(&upstream)
         .await;
