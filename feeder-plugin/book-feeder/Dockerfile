@@ -1,12 +1,13 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
-# book-feeder — Project Gutenberg feeder sidecar. Multi-stage build.
+# book-feeder — Project Gutenberg + Open Library feeder sidecar. Multi-stage
+# build; build context is this repo's root (the Cargo workspace).
 #
-# The build context must be `packages/meta-gateway/` (the workspace root) so
-# the `meta-feeder-sdk` path dependency (../../crates/meta-feeder-sdk) resolves.
-# Same BuildKit cache-mount strategy as the gateway Dockerfile: the cargo
-# registry/git and `target/` persist across builds. The release binary is
-# copied OUT of the target cache mount within the same RUN.
+# meta-feeder-sdk arrives as a git dependency (tag-pinned), so the vendored
+# `crates/` copy is not copied in — `git` must be present in the builder for
+# cargo to fetch it. Same BuildKit cache-mount strategy as the gateway
+# Dockerfile: the cargo registry/git and `target/` persist across builds. The
+# release binary is copied OUT of the target cache mount within the same RUN.
 # =============================================================================
 
 FROM rust:1.89-slim-bookworm AS builder
@@ -20,7 +21,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/ crates/
 COPY feeder-plugin/ feeder-plugin/
 
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \

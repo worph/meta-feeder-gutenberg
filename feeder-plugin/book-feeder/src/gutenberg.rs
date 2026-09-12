@@ -6,17 +6,24 @@
 //!   don't expose an epub variant fail `compute_outcomes` with a permanent
 //!   error (operator-visible; very rare in practice).
 //!
-//! No auth, no API key, no rate-limit configuration. Moved verbatim from the
-//! gateway crate's `plugins/gutenberg.rs`; only the import paths changed
-//! (`crate::*`/`super::common` → `meta_feeder_sdk::*`, `GatewayPlugin` →
-//! `FeederPlugin`).
+//! - Per-edition metadata: `GET {rdf_base}/cache/epub/{id}/pg{id}.rdf` for the
+//!   fields Gutendex does not carry (summary, release date, credits).
+//! - Work binding: Open Library's `search.json?q=id_project_gutenberg:{id}` —
+//!   see [`OpenLibraryClient::gutenberg_work`] and reading-model §2.4.
+//!
+//! No auth, no API key. Originally moved verbatim from the gateway crate's
+//! `plugins/gutenberg.rs`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use meta_feeder_sdk::budget::RateBudget;
 use meta_feeder_sdk::cache::MidhashCache;
 use meta_feeder_sdk::common;
+use meta_feeder_sdk::config::ConfigSchema;
+use meta_feeder_sdk::lang::normalize_lang_code;
 #[cfg(test)]
 use meta_feeder_sdk::plugin::HashKind;
 use meta_feeder_sdk::plugin::{upstream_id_field, ConfigError, FeederPlugin, HashOutcome};
@@ -25,9 +32,21 @@ use meta_feeder_sdk::types::{DiscoveryRecord, GatewayError, PluginHealth};
 use serde::Deserialize;
 use tracing::{debug, warn};
 
+use crate::openlibrary_client::{self, OpenLibraryClient};
+
 /// Canonical Gutendex base URL. Overridable via [`GutenbergPlugin::with_base_url`]
 /// for tests + private mirrors.
 const DEFAULT_BASE_URL: &str = "https://gutendex.com";
+
+/// Canonical host for the per-edition RDF. Overridable via
+/// [`GutenbergPlugin::with_rdf_base_url`] — until it was, every unit test that
+/// ran a query also fetched live RDF from gutenberg.org.
+const DEFAULT_RDF_BASE_URL: &str = "https://www.gutenberg.org";
+
+/// Upper bound on one binding lookup on the live search path, on top of the
+/// budget deadline. A slow Open Library must not hold a Gutenberg result that
+/// is already in hand.
+const BINDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// Format we treat as the canonical hashable bytes for a Gutenberg record.
 const EPUB_FORMAT: &str = "application/epub+zip";
@@ -64,7 +83,18 @@ const RETRY_BACKOFF_MS: u64 = 250;
 pub struct GutenbergPlugin {
     http: reqwest::Client,
     base_url: String,
+    rdf_base_url: String,
     cache: Option<MidhashCache>,
+    /// The Open Library binding client, built at `configure()`. `None` before
+    /// that — records are then simply unbound.
+    openlibrary: Option<OpenLibraryClient>,
+    /// Test hook for the Open Library API base. Never set in production.
+    openlibrary_base: Option<String>,
+    /// Shared with the `openlibrary` plugin by `main.rs`; built at
+    /// `configure()` when absent.
+    openlibrary_budget: Option<Arc<RateBudget>>,
+    /// The Open Library contact (see `openlibrary_client::load_contact`).
+    contact: Option<String>,
 }
 
 impl GutenbergPlugin {
@@ -80,8 +110,31 @@ impl GutenbergPlugin {
         Self {
             http,
             base_url,
+            rdf_base_url: DEFAULT_RDF_BASE_URL.to_string(),
             cache: None,
+            openlibrary: None,
+            openlibrary_base: None,
+            openlibrary_budget: None,
+            contact: openlibrary_client::env_contact(),
         }
+    }
+
+    /// Fetch the per-edition RDF from `rdf_base_url` instead of gutenberg.org.
+    pub fn with_rdf_base_url(mut self, rdf_base_url: String) -> Self {
+        self.rdf_base_url = rdf_base_url;
+        self
+    }
+
+    /// Send the Open Library binding lookup to `base` — tests only.
+    pub fn with_openlibrary_base_url(mut self, base: String) -> Self {
+        self.openlibrary_base = Some(base);
+        self
+    }
+
+    /// Draw binding lookups from a budget shared with the `openlibrary` plugin.
+    pub fn with_openlibrary_budget(mut self, budget: Arc<RateBudget>) -> Self {
+        self.openlibrary_budget = Some(budget);
+        self
     }
 
     fn cache(&self) -> Result<&MidhashCache, GatewayError> {
@@ -151,11 +204,13 @@ impl GutenbergPlugin {
         const BIBREC_CONCURRENCY: usize = 6;
         let cache = self.cache.clone();
         let http = self.http.clone();
+        let rdf_base = self.rdf_base_url.trim_end_matches('/').to_string();
         let ids: Vec<u64> = books.iter().map(|b| b.id).collect();
         stream::iter(ids.into_iter())
             .map(|id| {
                 let cache = cache.clone();
                 let http = http.clone();
+                let rdf_base = rdf_base.clone();
                 async move {
                     let record_id = id.to_string();
                     if let Some(cached) = cache
@@ -164,7 +219,7 @@ impl GutenbergPlugin {
                     {
                         return cached;
                     }
-                    let url = format!("https://www.gutenberg.org/cache/epub/{id}/pg{id}.rdf");
+                    let url = format!("{rdf_base}/cache/epub/{id}/pg{id}.rdf");
                     let resp = tokio::time::timeout(
                         std::time::Duration::from_secs(8),
                         http.get(&url).send(),
@@ -334,6 +389,57 @@ impl GutenbergPlugin {
             .collect()
             .await
     }
+
+    /// Each result's Open Library work, through the Project Gutenberg id Open
+    /// Library records (reading-model §2.4). Aligned with the input slice;
+    /// `None` means no binding — none recorded, ambiguous, not configured, over
+    /// budget, or the lookup failed.
+    ///
+    /// ⚠ **A failure never blocks or drops a record.** The binding upgrades an
+    /// edition that is already readable. Every failure is left uncached, so the
+    /// next query that surfaces the book tries again; the budget deadline is
+    /// short on purpose (`BINDING_DEADLINE`), so a cold browse row binds the
+    /// first handful of books and the cache fills the rest over later queries.
+    async fn fetch_openlibrary_works(&self, books: &[GutendexBook]) -> Vec<Option<String>> {
+        use futures::stream::{self, StreamExt};
+        const BINDING_CONCURRENCY: usize = 4;
+        let Some(client) = self.openlibrary.as_ref() else {
+            return vec![None; books.len()];
+        };
+        // Owned ids, not `books.iter().map(..)`: a borrowing closure inside the
+        // stream makes `handle_query`'s future fail the `async_trait` lifetime
+        // check ("FnOnce is not general enough").
+        let ids: Vec<u64> = books.iter().map(|b| b.id).collect();
+        stream::iter(ids)
+            .map(|id| async move {
+                let lookup = client.gutenberg_work(id, openlibrary_client::BINDING_DEADLINE);
+                match tokio::time::timeout(BINDING_TIMEOUT, lookup).await {
+                    Ok(Ok(work)) => work,
+                    Ok(Err(e)) => {
+                        debug!(
+                            target: "meta-share::gateway",
+                            upstream = "gutenberg",
+                            id,
+                            error = %e,
+                            "open library binding lookup failed; record left unbound"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        debug!(
+                            target: "meta-share::gateway",
+                            upstream = "gutenberg",
+                            id,
+                            "open library binding lookup timed out; record left unbound"
+                        );
+                        None
+                    }
+                }
+            })
+            .buffered(BINDING_CONCURRENCY)
+            .collect()
+            .await
+    }
 }
 
 impl Default for GutenbergPlugin {
@@ -349,7 +455,22 @@ impl FeederPlugin for GutenbergPlugin {
     }
 
     fn configure(&mut self, cache_dir: &Path) -> Result<(), ConfigError> {
-        self.cache = Some(common::open_midhash_cache(cache_dir, "gutenberg")?);
+        let cache = common::open_midhash_cache(cache_dir, "gutenberg")?;
+        // The binding cache rides this plugin's own redb (the `misc` table), so
+        // a binding survives a restart without touching the card plugin's store.
+        let contact = openlibrary_client::load_contact(cache_dir);
+        let budget = self
+            .openlibrary_budget
+            .clone()
+            .unwrap_or_else(|| openlibrary_client::budget(contact.is_some()));
+        self.openlibrary = Some(OpenLibraryClient::new(
+            budget,
+            Some(cache.clone()),
+            self.openlibrary_base.clone(),
+            contact.as_deref(),
+        ));
+        self.contact = contact;
+        self.cache = Some(cache);
         Ok(())
     }
 
@@ -405,13 +526,19 @@ impl FeederPlugin for GutenbergPlugin {
             "search returned"
         );
         let raw: Vec<GutendexBook> = body.results.into_iter().take(max_results).collect();
-        let (cover_cids, bibrecs) =
-            tokio::join!(self.fetch_cover_cids(&raw), self.fetch_bibrec_fields(&raw),);
+        let (cover_cids, bibrecs, works) = tokio::join!(
+            self.fetch_cover_cids(&raw),
+            self.fetch_bibrec_fields(&raw),
+            self.fetch_openlibrary_works(&raw),
+        );
         Ok(raw
             .into_iter()
             .zip(cover_cids)
             .zip(bibrecs)
-            .map(|((book, cover_cid), bibrec)| into_discovery_record(book, cover_cid, bibrec))
+            .zip(works)
+            .map(|(((book, cover_cid), bibrec), work)| {
+                into_discovery_record(book, cover_cid, bibrec, work)
+            })
             .collect())
     }
 
@@ -438,7 +565,26 @@ impl FeederPlugin for GutenbergPlugin {
             .ok()
             .flatten()
             .unwrap_or_default();
-        let record = into_discovery_record(book, cover_cid, bibrec);
+        // Not user-facing, so the binding lookup may queue for the full search
+        // deadline. A failure still leaves the record unbound, never fails the
+        // compute.
+        let work = match self.openlibrary.as_ref() {
+            Some(ol) => ol
+                .gutenberg_work(book.id, openlibrary_client::SEARCH_DEADLINE)
+                .await
+                .unwrap_or_else(|e| {
+                    debug!(
+                        target: "meta-share::gateway",
+                        upstream = "gutenberg",
+                        record_id,
+                        error = %e,
+                        "open library binding lookup failed; record left unbound"
+                    );
+                    None
+                }),
+            None => None,
+        };
+        let record = into_discovery_record(book, cover_cid, bibrec, work);
 
         Ok(common::single_outcome(
             cid,
@@ -481,13 +627,30 @@ impl FeederPlugin for GutenbergPlugin {
     fn served_content_kinds(&self) -> &'static [&'static str] {
         &["book"]
     }
+
+    /// ⚠ Declared HERE, not only on `openlibrary`. The SDK's `/config` page
+    /// edits the lowest hosted upstream id, which is this one — so this is where
+    /// the operator sets the contact both upstreams send to Open Library.
+    fn config_schema(&self) -> ConfigSchema {
+        ConfigSchema {
+            fields: vec![openlibrary_client::contact_field()],
+        }
+    }
+
+    fn config_values(&self) -> serde_json::Value {
+        serde_json::json!({ "contact": self.contact.clone().unwrap_or_default() })
+    }
 }
 
 /// Convert a `GutendexBook` into our wire-level `DiscoveryRecord`.
+///
+/// `openlibrary_work` is the binding from [`OpenLibraryClient::gutenberg_work`]:
+/// `Some` only when Open Library records exactly one work for this etext.
 fn into_discovery_record(
     book: GutendexBook,
     cover_cid: Option<String>,
     bibrec: BTreeMap<String, String>,
+    openlibrary_work: Option<String>,
 ) -> DiscoveryRecord {
     let GutendexBook {
         id,
@@ -520,6 +683,8 @@ fn into_discovery_record(
     fields.insert(upstream_id_field("gutenberg"), id.to_string());
 
     if !authors.is_empty() {
+        // Legacy scalar, kept verbatim for existing readers: Gutenberg's own
+        // "Last, First" spelling, comma-joined.
         fields.insert(
             "author".into(),
             authors
@@ -529,8 +694,27 @@ fn into_discovery_record(
                 .join(", "),
         );
     }
+    // `authors/{name}` key-set (reading-model §3.2): one member per person, in
+    // display order, so one author compares equal across sources — Open Library
+    // and AniList both write "Jane Austen", never "Austen, Jane".
+    for a in &authors {
+        if let Some(name) = display_name(&a.name) {
+            fields.insert(format!("authors/{name}"), "true".into());
+        }
+    }
     if let Some(lang) = languages.first() {
         fields.insert("language".into(), iso639_1_to_2(lang).to_string());
+    }
+    // `languages/{lang3}` key-set for EVERY language, in the stack's shared
+    // vocabulary (`fre`, where the legacy scalar above says `fra`). Two-letter
+    // codes only the local table knows (`la`, `ca`, `is`) are widened first;
+    // anything still not three letters is dropped rather than written as a
+    // member no `languages:` filter can match.
+    for lang in &languages {
+        let code = normalize_lang_code(iso639_1_to_2(&lang.trim().to_ascii_lowercase()));
+        if code.len() == 3 && code.bytes().all(|b| b.is_ascii_lowercase()) {
+            fields.insert(format!("languages/{code}"), "true".into());
+        }
     }
     if !subjects.is_empty() {
         fields.insert("subjects".into(), subjects.join(", "));
@@ -619,8 +803,35 @@ fn into_discovery_record(
     let _ = download_count;
     fields.insert("fileName".into(), format!("gutenberg-{id}.epub"));
 
+    // The work binding and its trust claim (reading-model §2.4). Written only on
+    // an identifier link Open Library itself records, so the claim is the plain
+    // Anchored form: `anchored` + `anchorSource`, and deliberately NO
+    // `anchorMethod` — that marks a title match, which this never is. The
+    // gateway transcribes the claim into `anchoredBy/openlibrary:OL…W` and
+    // strips the transient keys before storing.
+    if let Some(work) = openlibrary_work.filter(|w| openlibrary_client::is_work_id(w)) {
+        fields.insert("openlibraryid".into(), work);
+        fields.insert("anchored".into(), "true".into());
+        fields.insert("anchorSource".into(), "openlibrary".into());
+    }
+
     for (k, v) in bibrec {
         fields.entry(k).or_insert(v);
+    }
+
+    // Registry spellings beside the legacy RDF keys, derived after the merge so
+    // a bibrec cached before these keys existed produces them too.
+    //
+    // `description/eng` from `pgterms:marc520` (kept as `summary`): Gutenberg's
+    // summaries are written in English whatever the book's language, and
+    // `description/{lang3}` is the form every card and client reads.
+    if let Some(summary) = fields.get("summary").cloned() {
+        fields.entry("description/eng".into()).or_insert(summary);
+    }
+    // `releasedate` (iso-date) beside the legacy camelCase `releaseDate`, only
+    // when the RDF value really is one.
+    if let Some(date) = fields.get("releaseDate").and_then(|d| iso_date(d)) {
+        fields.entry("releasedate".into()).or_insert(date);
     }
 
     DiscoveryRecord {
@@ -628,6 +839,38 @@ fn into_discovery_record(
         record_id,
         fields,
     }
+}
+
+/// Gutenberg's "Last, First" → "First Last", the display order every other
+/// writer of `authors/{name}` uses.
+///
+/// Only when there is **exactly one** comma. "King, Martin Luther, Jr." or a
+/// corporate name has no safe reordering, and a wrong one is worse than
+/// Gutenberg's own spelling, which is kept as is.
+fn display_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return None;
+    }
+    match name.split(',').map(str::trim).collect::<Vec<_>>().as_slice() {
+        [last, first] if !last.is_empty() && !first.is_empty() => Some(format!("{first} {last}")),
+        _ => Some(name.to_string()),
+    }
+}
+
+/// `raw` when it is an `iso-date` (`YYYY-MM-DD`, or a bare `YYYY`), else `None`.
+///
+/// Never padded: "1998" does not become "1998-01-01", which would claim a
+/// precision the RDF never had.
+fn iso_date(raw: &str) -> Option<String> {
+    let digits = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_digit());
+    let t = raw.trim();
+    let ok = match t.split('-').collect::<Vec<_>>().as_slice() {
+        [y] => digits(y, 4),
+        [y, m, d] => digits(y, 4) && digits(m, 2) && digits(d, 2),
+        _ => false,
+    };
+    ok.then(|| t.to_string())
 }
 
 /// Parse a Project Gutenberg `pg{id}.rdf` document for per-edition metadata.
@@ -762,6 +1005,28 @@ mod rdf_parser_tests {
         let f = parse_pgterms_rdf("<html><body>not rdf</body></html>");
         assert!(f.is_empty());
     }
+
+    /// The legacy RDF keys stay; the registry spellings are derived beside them
+    /// on the record — including from a bibrec cached before those keys
+    /// existed, which holds only the legacy ones.
+    #[test]
+    fn summary_and_issued_date_also_arrive_under_registry_keys() {
+        let xml = r#"<rdf:RDF>
+            <dcterms:issued rdf:datatype="...">1998-06-01</dcterms:issued>
+            <pgterms:marc520>A classic novel of manners.</pgterms:marc520>
+          </rdf:RDF>"#;
+        let book: GutendexBook = serde_json::from_value(serde_json::json!({
+            "id": 1342,
+            "title": "Pride and Prejudice"
+        }))
+        .unwrap();
+        let r = into_discovery_record(book, None, parse_pgterms_rdf(xml), None);
+        let get = |k: &str| r.fields.get(k).map(String::as_str);
+        assert_eq!(get("summary"), Some("A classic novel of manners."));
+        assert_eq!(get("description/eng"), Some("A classic novel of manners."));
+        assert_eq!(get("releaseDate"), Some("1998-06-01"));
+        assert_eq!(get("releasedate"), Some("1998-06-01"));
+    }
 }
 
 /// ISO 639-1 (two-letter) → ISO 639-2/T (three-letter) for the ~20 most common
@@ -877,11 +1142,25 @@ mod tests {
         })
     }
 
+    /// Every upstream — Gutendex, the RDF host and Open Library — on the one mock
+    /// server, so no test reaches the internet. An unmounted path 404s, which
+    /// every optional lookup treats as "nothing there".
     fn configured_plugin_against(server: &MockServer) -> (GutenbergPlugin, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut plugin = GutenbergPlugin::with_base_url(server.uri());
+        let mut plugin = GutenbergPlugin::with_base_url(server.uri())
+            .with_rdf_base_url(server.uri())
+            .with_openlibrary_base_url(server.uri())
+            .with_openlibrary_budget(RateBudget::new(100.0, 100.0));
         plugin.configure(dir.path()).expect("configure");
         (plugin, dir)
+    }
+
+    /// Open Library's answer to `q=id_project_gutenberg:<id>`.
+    fn binding(id: u64, body: serde_json::Value) -> Mock {
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .and(query_param("q", format!("id_project_gutenberg:{id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
     }
 
     /// ⚠ The search path must ask for the CANONICAL `/books/`.
@@ -1086,7 +1365,16 @@ mod tests {
             Some("https://www.gutenberg.org/ebooks/1342")
         );
         assert_eq!(r0.fields.get("author").map(String::as_str), Some("Austen, Jane"));
+        assert_eq!(
+            r0.fields.get("authors/Jane Austen").map(String::as_str),
+            Some("true")
+        );
+        assert!(!r0.fields.contains_key("authors/Austen, Jane"));
         assert_eq!(r0.fields.get("language").map(String::as_str), Some("eng"));
+        assert_eq!(r0.fields.get("languages/eng").map(String::as_str), Some("true"));
+        // No Open Library answer mounted: the record is returned, unbound.
+        assert!(!r0.fields.contains_key("openlibraryid"));
+        assert!(!r0.fields.contains_key("anchored"));
         assert_eq!(r0.fields.get("format").map(String::as_str), Some("epub"));
         assert_eq!(
             r0.fields.get("fileName").map(String::as_str),
@@ -1259,6 +1547,211 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn display_name_reorders_only_a_single_comma() {
+        assert_eq!(display_name("Austen, Jane").as_deref(), Some("Jane Austen"));
+        assert_eq!(
+            display_name("Shelley, Mary Wollstonecraft").as_deref(),
+            Some("Mary Wollstonecraft Shelley")
+        );
+        assert_eq!(
+            display_name("King, Martin Luther, Jr.").as_deref(),
+            Some("King, Martin Luther, Jr.")
+        );
+        assert_eq!(display_name("Homer").as_deref(), Some("Homer"));
+        assert_eq!(display_name("  "), None);
+    }
+
+    #[test]
+    fn every_language_becomes_a_lang3_key_set_member() {
+        let book: GutendexBook = serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "title": "Polyglot",
+            "languages": ["en", "fr", "la", "xx"]
+        }))
+        .unwrap();
+        let r = into_discovery_record(book, None, BTreeMap::new(), None);
+        let members: Vec<&str> = r
+            .fields
+            .keys()
+            .filter_map(|k| k.strip_prefix("languages/"))
+            .collect();
+        // The SDK vocabulary (`fre`), every language, and nothing that is not
+        // three letters.
+        assert_eq!(members, vec!["eng", "fre", "lat"]);
+        // The legacy scalar is untouched.
+        assert_eq!(r.fields.get("language").map(String::as_str), Some("eng"));
+    }
+
+    #[test]
+    fn releasedate_is_written_only_for_an_iso_date() {
+        assert_eq!(iso_date("2008-06-27").as_deref(), Some("2008-06-27"));
+        assert_eq!(iso_date("1998").as_deref(), Some("1998"));
+        assert_eq!(iso_date("1998-06"), None);
+        assert_eq!(iso_date("June 1998"), None);
+    }
+
+    /// The RDF host is configurable, so the per-edition fields are testable
+    /// without gutenberg.org.
+    #[tokio::test]
+    async fn rdf_summary_and_issue_date_arrive_through_the_configured_rdf_host() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/cache/epub/1342/pg1342.rdf"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<rdf:RDF><pgterms:ebook rdf:about="ebooks/1342">
+                     <dcterms:issued rdf:datatype="http://www.w3.org/2001/XMLSchema#date">1998-06-01</dcterms:issued>
+                     <pgterms:marc520>"Pride and Prejudice" is a classic novel.</pgterms:marc520>
+                   </pgterms:ebook></rdf:RDF>"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let records = plugin
+            .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+            .await
+            .expect("handle_query");
+        let pride = &records[0].fields;
+        assert!(pride["description/eng"].contains("classic novel"));
+        assert_eq!(pride.get("releasedate").map(String::as_str), Some("1998-06-01"));
+        // No RDF mounted for 84: neither key, and the record still arrives.
+        assert!(!records[1].fields.contains_key("description/eng"));
+        assert!(!records[1].fields.contains_key("releasedate"));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn exactly_one_open_library_work_binds_the_edition_with_an_anchored_claim() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+        binding(
+            1342,
+            serde_json::json!({ "numFound": 1, "docs": [
+                { "key": "/works/OL66554W", "id_project_gutenberg": ["1342", "42671", "45186"] }
+            ]}),
+        )
+        .mount(&server)
+        .await;
+        // Two works list etext 84: an unmerged duplicate, so no binding at all.
+        binding(
+            84,
+            serde_json::json!({ "numFound": 2, "docs": [
+                { "key": "/works/OL450063W", "id_project_gutenberg": ["84"] },
+                { "key": "/works/OL18388W", "id_project_gutenberg": ["84"] }
+            ]}),
+        )
+        .mount(&server)
+        .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let records = plugin
+            .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+            .await
+            .expect("handle_query");
+        assert_eq!(records.len(), 2);
+
+        let pride = &records[0].fields;
+        assert_eq!(pride.get("openlibraryid").map(String::as_str), Some("OL66554W"));
+        assert_eq!(pride.get("anchored").map(String::as_str), Some("true"));
+        assert_eq!(pride.get("anchorSource").map(String::as_str), Some("openlibrary"));
+        assert!(
+            !pride.contains_key("anchorMethod"),
+            "an identifier link Open Library records is not a title match"
+        );
+
+        let frankenstein = &records[1].fields;
+        for k in ["openlibraryid", "anchored", "anchorSource", "anchorMethod"] {
+            assert!(!frankenstein.contains_key(k), "ambiguous binding must not stamp {k}");
+        }
+    }
+
+    /// ⚠ A binding failure never costs the record.
+    #[tokio::test]
+    async fn no_work_or_a_failed_lookup_leaves_the_record_unbound_but_present() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+        binding(1342, serde_json::json!({ "numFound": 0, "docs": [] }))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search.json"))
+            .and(query_param("q", "id_project_gutenberg:84"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        let records = plugin
+            .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+            .await
+            .expect("an Open Library failure must not fail the query");
+        assert_eq!(records.len(), 2);
+        for r in &records {
+            assert!(!r.fields.contains_key("openlibraryid"));
+            assert!(!r.fields.contains_key("anchored"));
+        }
+    }
+
+    /// A book surfaced by every browse must not cost a lookup every browse.
+    #[tokio::test]
+    async fn a_binding_answer_is_looked_up_once_per_book() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/books/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(books_json()))
+            .mount(&server)
+            .await;
+        binding(
+            1342,
+            serde_json::json!({ "numFound": 1, "docs": [
+                { "key": "/works/OL66554W", "id_project_gutenberg": ["1342"] }
+            ]}),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+        binding(84, serde_json::json!({ "numFound": 0, "docs": [] }))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (plugin, _dir) = configured_plugin_against(&server);
+        for _ in 0..2 {
+            let records = plugin
+                .handle_query(&GatewayQuery::from_free_text("alice"), 50)
+                .await
+                .expect("handle_query");
+            assert_eq!(
+                records[0].fields.get("openlibraryid").map(String::as_str),
+                Some("OL66554W")
+            );
+        }
+        server.verify().await;
+    }
+
+    /// The SDK's config page shows the lowest upstream id — this one — so the
+    /// Open Library contact must be settable here.
+    #[test]
+    fn the_open_library_contact_is_configurable_on_this_upstream() {
+        let schema = GutenbergPlugin::new().config_schema();
+        assert!(schema.fields.iter().any(|f| f.key == "contact"));
     }
 
     #[test]

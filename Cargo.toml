@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "feeder-plugin/*"]
+members = ["feeder-plugin/*"]
+# The vendored SDK copy is no longer built: book-feeder pins meta-feeder-sdk by
+# git tag. Excluded (not deleted) so a stray `cargo` run inside it does not try
+# to join this workspace.
+exclude = ["crates/meta-feeder-sdk"]
 
 [workspace.package]
 edition = "2021"

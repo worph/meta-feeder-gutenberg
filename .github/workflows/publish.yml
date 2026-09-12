@@ -3,8 +3,8 @@ name: Publish image
 # Build and push the feeder image to the GitHub Container Registry (ghcr.io):
 #   * every push to main  -> the moving `main` tag
 #   * every `v*` tag       -> semver tags (e.g. v1.0.0 -> 1.0.0, 1.0, 1)
-# The build context is the repo root (the workspace) so the vendored
-# `meta-feeder-sdk` path dependency resolves; the Dockerfile lives under
+# The build context is the repo root (the workspace); `meta-feeder-sdk` is a
+# tag-pinned git dependency fetched during the build. The Dockerfile lives under
 # feeder-plugin/book-feeder/.
 on:
   push:
