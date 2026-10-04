@@ -24,7 +24,7 @@ path = "src/main.rs"
 # vendored copy this used to point at had already drifted behind the shared SDK
 # (no `RateBudget`, a capped card cid). The rest of the fleet pins the same
 # way; see meta-feeder-anilist's manifest.
-meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.2.1" }
+meta-feeder-sdk = { git = "https://github.com/worph/meta-feeder-sdk", tag = "v1.7.0" }
 
 tokio = { version = "1.40", features = ["full"] }
 axum = { version = "0.7", features = ["json"] }
